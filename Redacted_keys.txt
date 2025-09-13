@@ -1,0 +1,27 @@
+# --- CORE ENGINE & HARVESTING ---
+TELEGRAM_TOKEN=
+OWNER_ID=
+PUBLIC_CHAT_ID=
+VIP_CHAT_ID=
+SYNDICA_API_KEY=wss:/
+SYNDICA_API_KEY=
+HELIUS_API_KEY=
+ALCHEMY_API_KEY=
+GEMINI_API_KEY=
+
+# --- DEEP DIVE & ANALYSIS ---
+BITQUERY_API_KEY=	
+SOLSCAN_API_KEY=
+X_BEARER_TOKEN=
+BIRDEYE_API_KEY=
+
+# --- OPTIONAL ENRICHMENT ---
+RUGCHECK_JWT=
+COINGECKO_API_KEY=
+CMC_API_KEY=
+BIRDEYE_API_KEY=
+
+# =========================================================
+# ||                TOKEN TONY'S WORKSHOP                ||
+# ||          ENVIRONMENT VARIABLES (.env) FILE          ||
+# =========================================================
