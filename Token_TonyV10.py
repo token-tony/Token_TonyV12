@@ -1439,8 +1439,13 @@ async def push_segment_to_chat(app: Application, chat_id: int, segment: str) -> 
                     # Unexpected edit error — try sending a fresh message
                     mid = None
         if not mid:
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            await set_push_message_id(chat_id, segment)
+            sent = await app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            await set_push_message_id(chat_id, segment, getattr(sent, "message_id", None))
     except Exception as e:
         log.error(f"Error pushing segment {segment} to chat {chat_id}: {e}")
 
