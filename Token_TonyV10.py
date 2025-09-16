@@ -328,6 +328,7 @@ DEX_PROGRAMS_FOR_FIREHOSE = {
 
 # --- Global State ---
 FIREHOSE_STATUS: Dict[str, str] = {}
+provider_state: Dict[str, Dict[str, Any]] = {}
 PUMPFUN_STATUS = "🔴 Disconnected"
 # Adaptive processing state
 from collections import deque
@@ -435,10 +436,22 @@ FLOW_KEYWORDS = {"swap"}
 
 async def _logs_subscriber(provider_name: str, ws_url: str, rpc_url: str):
     key = f"Logs-{provider_name}"
-    FIREHOSE_STATUS[key] = "🟡 Connecting"
+    state = provider_state.setdefault(
+        provider_name,
+        {
+            "consecutive_failures": 0,
+            "last_success": 0.0,
+            "last_failure": 0.0,
+            "messages_received": 0,
+            "current_backoff": 0.0,
+            "last_error": "",
+        },
+    )
     subscriptions = []
+    base_backoff = 10
     while True:
         try:
+            FIREHOSE_STATUS[key] = "🟡 Connecting"
             log.info(f"Logs Firehose ({provider_name}): Connecting {ws_url} ...")
             # Helius suggests pings approx every 60s; keep heartbeat under that
             async with websockets.connect(ws_url, ping_interval=55) as websocket:
@@ -451,61 +464,85 @@ async def _logs_subscriber(provider_name: str, ws_url: str, rpc_url: str):
                     }
                     await websocket.send(json.dumps(sub))
                     subscriptions.append(sub["id"])
+                state["consecutive_failures"] = 0
+                state["current_backoff"] = 0.0
+                state["last_success"] = time.time()
+                state["last_error"] = ""
                 FIREHOSE_STATUS[key] = "🟢 Connected"
                 log.info(f"✅ Logs Firehose ({provider_name}): Subscribed to {len(DEX_PROGRAMS_FOR_FIREHOSE)} programs.")
                 client = await get_http_client()
                 while websocket.open:
-                        try:
-                            raw = await asyncio.wait_for(websocket.recv(), timeout=90.0)
-                            msg = json.loads(raw)
-                            if msg.get("method") != "logsNotification":
-                                continue
-                            result = msg.get("params", {}).get("result", {})
-                            signature = result.get("value", {}).get("signature")
-                            if not signature:
-                                continue
-                            # Check logs text for relevant signals before fetching tx
-                            logs_list = (result.get("value", {}).get("logs") or [])
-                            logs_text = "\n".join(logs_list).lower()
-                            # Dial back: only react to pool birth to reduce Helius load
-                            if not any(k in logs_text for k in POOL_BIRTH_KEYWORDS):
-                                continue
+                    try:
+                        raw = await asyncio.wait_for(websocket.recv(), timeout=90.0)
+                    except asyncio.TimeoutError:
+                        log.info(f"Logs Firehose ({provider_name}): idle, connection alive.")
+                        continue
 
-                            # Rate-limit transaction lookups to reduce RPC spend
-                            tx_res = await _fetch_transaction(client, rpc_url, signature)
-                            if not tx_res:
-                                continue
-                            # Optional: ignore very old transactions to avoid backfill floods
+                    msg = json.loads(raw)
+                    if msg.get("method") != "logsNotification":
+                        continue
+                    result = msg.get("params", {}).get("result", {})
+                    signature = result.get("value", {}).get("signature")
+                    if not signature:
+                        continue
+                    state["messages_received"] += 1
+                    state["last_success"] = time.time()
+                    if state["messages_received"] % 500 == 0:
+                        log.info(
+                            "Logs Firehose (%s): processed %s messages.",
+                            provider_name,
+                            state["messages_received"],
+                        )
+                    # Check logs text for relevant signals before fetching tx
+                    logs_list = (result.get("value", {}).get("logs") or [])
+                    logs_text = "\n".join(logs_list).lower()
+                    # Dial back: only react to pool birth to reduce Helius load
+                    if not any(k in logs_text for k in POOL_BIRTH_KEYWORDS):
+                        continue
+
+                    # Rate-limit transaction lookups to reduce RPC spend
+                    tx_res = await _fetch_transaction(client, rpc_url, signature)
+                    if not tx_res:
+                        continue
+                    # Optional: ignore very old transactions to avoid backfill floods
+                    try:
+                        bt = tx_res.get("blockTime")
+                        if bt and (time.time() - int(bt)) > 600:
+                            continue
+                    except Exception:
+                        pass
+                    bt = tx_res.get("blockTime")
+                    for mint in _extract_mints_from_tx_result(tx_res):
+                        mint = _sanitize_mint(mint)
+                        if not mint:
+                            continue
+                        if bt:
                             try:
-                                bt = tx_res.get("blockTime")
-                                if bt and (time.time() - int(bt)) > 600:
-                                    continue
+                                POOL_BIRTH_CACHE[mint] = int(bt)
                             except Exception:
                                 pass
-                            bt = tx_res.get("blockTime")
-                            for mint in _extract_mints_from_tx_result(tx_res):
-                                mint = _sanitize_mint(mint)
-                                if not mint:
-                                    continue
-                                if bt:
-                                    try:
-                                        POOL_BIRTH_CACHE[mint] = int(bt)
-                                    except Exception:
-                                        pass
-                                log.info(f"Logs Firehose ({provider_name}): discovered candidate mint {mint} from signature {signature}")
-                                async def _queue():
-                                    await DISCOVERY_BUCKET.acquire(1)
-                                    await process_discovered_token(mint)
-                                asyncio.create_task(_queue())
-                        except asyncio.TimeoutError:
-                            log.info(f"Logs Firehose ({provider_name}): idle, connection alive.")
-                        except Exception as e:
-                            log.error(f"Logs Firehose ({provider_name}): error {e}, reconnecting...")
-                            break
+                        log.info(f"Logs Firehose ({provider_name}): discovered candidate mint {mint} from signature {signature}")
+                        async def _queue():
+                            await DISCOVERY_BUCKET.acquire(1)
+                            await process_discovered_token(mint)
+                        asyncio.create_task(_queue())
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            FIREHOSE_STATUS[key] = f"🔴 Error: {e.__class__.__name__}"
-            log.error(f"Logs Firehose ({provider_name}): connection failed: {e}. Retrying in 30s...")
-            await asyncio.sleep(30)
+            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+            state["last_failure"] = time.time()
+            state["last_error"] = str(e)
+            backoff = min(300, base_backoff * (2 ** max(0, state["consecutive_failures"] - 1)))
+            state["current_backoff"] = float(backoff)
+            FIREHOSE_STATUS[key] = f"🔴 Error: {e.__class__.__name__} (retry in {int(backoff)}s)"
+            log.error(
+                "Logs Firehose (%s): connection failed after %s consecutive errors: %s. Retrying in %ss...",
+                provider_name,
+                state["consecutive_failures"],
+                e,
+                int(backoff),
+            )
+            await asyncio.sleep(backoff)
 
 async def logs_firehose_worker():
     """Start logsSubscribe firehose across configured providers (Helius/Syndica/Alchemy)."""
@@ -2105,7 +2142,57 @@ async def diag(u: Update, c: ContextTypes.DEFAULT_TYPE):
     status_lines.append("\n**🔥 Data Firehose Status:**")
     for source, status in FIREHOSE_STATUS.items():
         status_lines.append(f"• {source}: {status}")
-    
+    if provider_state:
+        status_lines.append("\n**📡 Provider Health:**")
+        now = time.time()
+        for provider, stats in provider_state.items():
+            last_success = stats.get("last_success") or 0
+            if last_success:
+                age = int(now - last_success)
+                if age < 60:
+                    last_success_str = f"{age}s ago"
+                elif age < 3600:
+                    last_success_str = f"{age // 60}m ago"
+                elif age < 86400:
+                    last_success_str = f"{age // 3600}h ago"
+                else:
+                    last_success_str = "stale"
+            else:
+                last_success_str = "never"
+            last_failure = stats.get("last_failure") or 0
+            if last_failure:
+                fail_age = int(now - last_failure)
+                if fail_age < 60:
+                    last_failure_str = f"{fail_age}s ago"
+                elif fail_age < 3600:
+                    last_failure_str = f"{fail_age // 60}m ago"
+                elif fail_age < 86400:
+                    last_failure_str = f"{fail_age // 3600}h ago"
+                else:
+                    last_failure_str = "stale"
+            else:
+                last_failure_str = "never"
+            failures = stats.get("consecutive_failures", 0)
+            msg_total = stats.get("messages_received", 0)
+            backoff = int(stats.get("current_backoff") or 0)
+            parts = [
+                f"• {provider}: {msg_total} msgs",
+                f"last success {last_success_str}",
+                f"consecutive failures {failures}",
+            ]
+            if last_failure_str != "never":
+                parts.append(f"last failure {last_failure_str}")
+            if failures:
+                parts.append(f"backoff {backoff}s")
+            if stats.get("last_error"):
+                err = stats["last_error"]
+                if len(err) > 80:
+                    err = err[:77] + "..."
+                parts.append(f"error `{err}`")
+            status_lines.append(
+                ", ".join(parts)
+            )
+
     # Tony's bucket distribution
     try:
         bucket_query = """
