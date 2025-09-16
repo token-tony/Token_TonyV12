@@ -29,15 +29,55 @@ from config import (ALCHEMY_WS_URL, BIRDEYE_API_KEY, CONFIG,
                     TELEGRAM_TOKEN, VIP_CHAT_ID)
 from analysis import (POOL_BIRTH_CACHE, enrich_token_intel,
                       _compute_mms, _compute_score, _compute_sss)
-from api import (API_PROVIDERS, LITE_MODE_UNTIL, _fetch,
-                 extract_mint_from_check_text, fetch_birdeye,
-                 fetch_dexscreener_by_mint,
-                 fetch_dexscreener_chart, fetch_market_snapshot)
+try:
+    from .api_core import (
+        API_HEALTH,
+        API_PROVIDERS,
+        GECKO_API_URL,
+        LITE_MODE_UNTIL,
+        _fetch,
+        extract_mint_from_check_text,
+        fetch_birdeye,
+        fetch_dexscreener_by_mint,
+        fetch_dexscreener_chart,
+        fetch_market_snapshot,
+    )
+    from .db_core import (
+        _execute_db,
+        get_push_message_id,
+        get_recently_served_mints,
+        load_latest_snapshot,
+        mark_as_served,
+        save_snapshot,
+        setup_database,
+        set_push_message_id,
+        upsert_token_intel,
+    )
+except ImportError:  # pragma: no cover - script execution fallback
+    from api_core import (  # type: ignore
+        API_HEALTH,
+        API_PROVIDERS,
+        GECKO_API_URL,
+        LITE_MODE_UNTIL,
+        _fetch,
+        extract_mint_from_check_text,
+        fetch_birdeye,
+        fetch_dexscreener_by_mint,
+        fetch_dexscreener_chart,
+        fetch_market_snapshot,
+    )
+    from db_core import (  # type: ignore
+        _execute_db,
+        get_push_message_id,
+        get_recently_served_mints,
+        load_latest_snapshot,
+        mark_as_served,
+        save_snapshot,
+        setup_database,
+        set_push_message_id,
+        upsert_token_intel,
+    )
 from rpc_providers import RPC_PROVIDERS, rpc_post
-from db import (_execute_db, get_push_message_id,
-                get_recently_served_mints, load_latest_snapshot,
-                mark_as_served, save_snapshot, setup_database,
-                set_push_message_id, upsert_token_intel)
 from reports import (
     build_full_report2,
     load_advanced_quips,
@@ -289,6 +329,7 @@ DEX_PROGRAMS_FOR_FIREHOSE = {
 
 # --- Global State ---
 FIREHOSE_STATUS: Dict[str, str] = {}
+provider_state: Dict[str, Dict[str, Any]] = {}
 PUMPFUN_STATUS = "🔴 Disconnected"
 # Adaptive processing state
 from collections import deque
@@ -360,6 +401,21 @@ async def pumpportal_worker():
 
 ## Removed legacy Pump.fun client-api worker and Helius programSubscribe variant (unused).
 
+async def _fetch_transaction_via_rpc(signature: str) -> Optional[Dict[str, Any]]:
+    """Fetch a transaction using the RPC failover pool."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            signature,
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
+        ],
+    }
+    response = await rpc_post(payload)
+    return (response or {}).get("result") if response else None
+
+
 def _extract_mints_from_tx_result(tx_result: Dict[str, Any]) -> List[str]:
     """Best-effort extraction of base/quote mints from a transaction result."""
     mints: set = set()
@@ -367,7 +423,6 @@ def _extract_mints_from_tx_result(tx_result: Dict[str, Any]) -> List[str]:
     for bal in meta.get("postTokenBalances", []) + meta.get("preTokenBalances", []):
         if mint := bal.get("mint"):
             mints.add(mint)
-    # Also scan any parsed instruction infos that expose a 'mint'
     try:
         tx = tx_result.get("transaction", {})
         msg = tx.get("message", {})
@@ -378,7 +433,6 @@ def _extract_mints_from_tx_result(tx_result: Dict[str, Any]) -> List[str]:
                     mints.add(mint)
     except Exception:
         pass
-    # Filter out known quote mints and limit number
     filtered = [m for m in mints if m not in KNOWN_QUOTE_MINTS]
     return filtered[:4]
 
@@ -388,99 +442,118 @@ FLOW_KEYWORDS = {"swap"}
 
 async def _logs_subscriber(provider_name: str, ws_url: str):
     key = f"Logs-{provider_name}"
-    FIREHOSE_STATUS[key] = "🟡 Connecting"
+    state = provider_state.setdefault(
+        provider_name,
+        {
+            "consecutive_failures": 0,
+            "last_success": 0.0,
+            "last_failure": 0.0,
+            "messages_received": 0,
+            "current_backoff": 0.0,
+            "last_error": "",
+        },
+    )
     subscriptions = []
+    base_backoff = 10
     while True:
         try:
+            FIREHOSE_STATUS[key] = "🟡 Connecting"
             log.info(f"Logs Firehose ({provider_name}): Connecting {ws_url} ...")
-            # Helius suggests pings approx every 60s; keep heartbeat under that
             async with websockets.connect(ws_url, ping_interval=55) as websocket:
-                # Subscribe per DEX program using logsSubscribe mentions
                 for name, d in DEX_PROGRAMS_FOR_FIREHOSE.items():
                     sub = {
-                        "jsonrpc": "2.0", "id": random.randint(1000, 999999), "method": "logsSubscribe",
-                        # Use mentions array per Solana WS API
-                        "params": [{"mentions": [d["program_id"]]}, {"commitment": "processed"}]
+                        "jsonrpc": "2.0",
+                        "id": random.randint(1000, 999999),
+                        "method": "logsSubscribe",
+                        "params": [{"mentions": [d["program_id"]]}, {"commitment": "processed"}],
                     }
                     await websocket.send(json.dumps(sub))
                     subscriptions.append(sub["id"])
+                state["consecutive_failures"] = 0
+                state["current_backoff"] = 0.0
+                state["last_success"] = time.time()
+                state["last_error"] = ""
                 FIREHOSE_STATUS[key] = "🟢 Connected"
                 log.info(f"✅ Logs Firehose ({provider_name}): Subscribed to {len(DEX_PROGRAMS_FOR_FIREHOSE)} programs.")
                 while websocket.open:
-                        try:
-                            raw = await asyncio.wait_for(websocket.recv(), timeout=90.0)
-                            msg = json.loads(raw)
-                            if msg.get("method") != "logsNotification":
-                                continue
-                            result = msg.get("params", {}).get("result", {})
-                            signature = result.get("value", {}).get("signature")
-                            if not signature:
-                                continue
-                            # Check logs text for relevant signals before fetching tx
-                            logs_list = (result.get("value", {}).get("logs") or [])
-                            logs_text = "\n".join(logs_list).lower()
-                            # Dial back: only react to pool birth to reduce Helius load
-                            if not any(k in logs_text for k in POOL_BIRTH_KEYWORDS):
-                                continue
+                    try:
+                        raw = await asyncio.wait_for(websocket.recv(), timeout=90.0)
+                    except asyncio.TimeoutError:
+                        log.info(f"Logs Firehose ({provider_name}): idle, connection alive.")
+                        continue
 
-                            # Rate-limit transaction lookups to reduce RPC spend
-                            payload = {
-                                "jsonrpc": "2.0",
-                                "id": 1,
-                                "method": "getTransaction",
-                                "params": [
-                                    signature,
-                                    {
-                                        "encoding": "jsonParsed",
-                                        "maxSupportedTransactionVersion": 0,
-                                    },
-                                ],
-                            }
+                    msg = json.loads(raw)
+                    if msg.get("method") != "logsNotification":
+                        continue
+                    result = msg.get("params", {}).get("result", {})
+                    signature = result.get("value", {}).get("signature")
+                    if not signature:
+                        continue
+                    state["messages_received"] += 1
+                    state["last_success"] = time.time()
+                    if state["messages_received"] % 500 == 0:
+                        log.info(
+                            "Logs Firehose (%s): processed %s messages.",
+                            provider_name,
+                            state["messages_received"],
+                        )
+                    logs_list = (result.get("value", {}).get("logs") or [])
+                    logs_text = "\n".join(logs_list).lower()
+                    if not any(k in logs_text for k in POOL_BIRTH_KEYWORDS):
+                        continue
+                    try:
+                        tx_res = await _fetch_transaction_via_rpc(signature)
+                    except Exception as exc:
+                        log.warning(
+                            "Logs Firehose (%s): RPC lookup for %s failed (%s)",
+                            provider_name,
+                            signature,
+                            exc,
+                        )
+                        continue
+                    if not tx_res:
+                        continue
+                    try:
+                        bt = tx_res.get("blockTime")
+                        if bt and (time.time() - int(bt)) > 600:
+                            continue
+                    except Exception:
+                        pass
+                    bt = tx_res.get("blockTime")
+                    for mint in _extract_mints_from_tx_result(tx_res):
+                        mint = _sanitize_mint(mint)
+                        if not mint:
+                            continue
+                        if bt:
                             try:
-                                rpc_response = await rpc_post(payload)
-                            except Exception as e:  # noqa: BLE001
-                                log.warning(
-                                    "Logs Firehose (%s): RPC lookup for %s failed (%s)",
-                                    provider_name,
-                                    signature,
-                                    e,
-                                )
-                                continue
-
-                            tx_res = (rpc_response or {}).get("result") if rpc_response else None
-                            if not tx_res:
-                                continue
-                            # Optional: ignore very old transactions to avoid backfill floods
-                            try:
-                                bt = tx_res.get("blockTime")
-                                if bt and (time.time() - int(bt)) > 600:
-                                    continue
+                                POOL_BIRTH_CACHE[mint] = int(bt)
                             except Exception:
                                 pass
-                            bt = tx_res.get("blockTime")
-                            for mint in _extract_mints_from_tx_result(tx_res):
-                                mint = _sanitize_mint(mint)
-                                if not mint:
-                                    continue
-                                if bt:
-                                    try:
-                                        POOL_BIRTH_CACHE[mint] = int(bt)
-                                    except Exception:
-                                        pass
-                                log.info(f"Logs Firehose ({provider_name}): discovered candidate mint {mint} from signature {signature}")
-                                async def _queue():
-                                    await DISCOVERY_BUCKET.acquire(1)
-                                    await process_discovered_token(mint)
-                                asyncio.create_task(_queue())
-                        except asyncio.TimeoutError:
-                            log.info(f"Logs Firehose ({provider_name}): idle, connection alive.")
-                        except Exception as e:
-                            log.error(f"Logs Firehose ({provider_name}): error {e}, reconnecting...")
-                            break
+                        log.info(
+                            f"Logs Firehose ({provider_name}): discovered candidate mint {mint} from signature {signature}",
+                        )
+                        async def _queue():
+                            await DISCOVERY_BUCKET.acquire(1)
+                            await process_discovered_token(mint)
+                        asyncio.create_task(_queue())
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            FIREHOSE_STATUS[key] = f"🔴 Error: {e.__class__.__name__}"
-            log.error(f"Logs Firehose ({provider_name}): connection failed: {e}. Retrying in 30s...")
-            await asyncio.sleep(30)
+            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+            state["last_failure"] = time.time()
+            state["last_error"] = str(e)
+            backoff = min(300, base_backoff * (2 ** max(0, state["consecutive_failures"] - 1)))
+            state["current_backoff"] = float(backoff)
+            FIREHOSE_STATUS[key] = f"🔴 Error: {e.__class__.__name__} (retry in {int(backoff)}s)"
+            log.error(
+                "Logs Firehose (%s): connection failed after %s consecutive errors: %s. Retrying in %ss...",
+                provider_name,
+                state["consecutive_failures"],
+                e,
+                int(backoff),
+            )
+            await asyncio.sleep(backoff)
+
 
 async def logs_firehose_worker():
     """Start logsSubscribe firehose across configured providers (Helius/Syndica/Alchemy)."""
@@ -504,7 +577,6 @@ async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
     """Discover recent Raydium pools on Solana via GeckoTerminal v2.
     Endpoint: /api/v2/networks/solana/new_pools?include=base_token,quote_token,dex,network
     """
-    from api import GECKO_API_URL
     mints: set = set()
     headers = {
         "Accept": "application/json;version=20230302",
@@ -540,7 +612,6 @@ async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
 async def _discover_from_gecko_search(client: httpx.AsyncClient, query: str) -> List[str]:
     """Search pools globally and filter to Solana/Raydium."""
     mints: set = set()
-    from api import GECKO_API_URL
     from analysis import GECKO_SEARCH_CACHE
 
     headers = {
@@ -1457,8 +1528,16 @@ async def push_segment_to_chat(app: Application, chat_id: int, segment: str) -> 
                     # Unexpected edit error — try sending a fresh message
                     mid = None
         if not mid:
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            await set_push_message_id(chat_id, segment)
+            sent = await app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            try:
+                await set_push_message_id(chat_id, segment, sent.message_id)
+            except Exception:
+                log.debug("Failed to persist push message id for chat %s segment %s", chat_id, segment)
     except Exception as e:
         log.error(f"Error pushing segment {segment} to chat {chat_id}: {e}")
 
@@ -2027,7 +2106,6 @@ async def diag(u: Update, c: ContextTypes.DEFAULT_TYPE):
     
     # Tony's API health monitoring
     status_lines.append("\n**🌐 API Health Status:**")
-    from api import API_HEALTH
     for provider, stats in API_HEALTH.items():
         total = stats['success'] + stats['failure']
         if total > 0:
@@ -2078,7 +2156,57 @@ async def diag(u: Update, c: ContextTypes.DEFAULT_TYPE):
     status_lines.append("\n**🔥 Data Firehose Status:**")
     for source, status in FIREHOSE_STATUS.items():
         status_lines.append(f"• {source}: {status}")
-    
+    if provider_state:
+        status_lines.append("\n**📡 Provider Health:**")
+        now = time.time()
+        for provider, stats in provider_state.items():
+            last_success = stats.get("last_success") or 0
+            if last_success:
+                age = int(now - last_success)
+                if age < 60:
+                    last_success_str = f"{age}s ago"
+                elif age < 3600:
+                    last_success_str = f"{age // 60}m ago"
+                elif age < 86400:
+                    last_success_str = f"{age // 3600}h ago"
+                else:
+                    last_success_str = "stale"
+            else:
+                last_success_str = "never"
+            last_failure = stats.get("last_failure") or 0
+            if last_failure:
+                fail_age = int(now - last_failure)
+                if fail_age < 60:
+                    last_failure_str = f"{fail_age}s ago"
+                elif fail_age < 3600:
+                    last_failure_str = f"{fail_age // 60}m ago"
+                elif fail_age < 86400:
+                    last_failure_str = f"{fail_age // 3600}h ago"
+                else:
+                    last_failure_str = "stale"
+            else:
+                last_failure_str = "never"
+            failures = stats.get("consecutive_failures", 0)
+            msg_total = stats.get("messages_received", 0)
+            backoff = int(stats.get("current_backoff") or 0)
+            parts = [
+                f"• {provider}: {msg_total} msgs",
+                f"last success {last_success_str}",
+                f"consecutive failures {failures}",
+            ]
+            if last_failure_str != "never":
+                parts.append(f"last failure {last_failure_str}")
+            if failures:
+                parts.append(f"backoff {backoff}s")
+            if stats.get("last_error"):
+                err = stats["last_error"]
+                if len(err) > 80:
+                    err = err[:77] + "..."
+                parts.append(f"error `{err}`")
+            status_lines.append(
+                ", ".join(parts)
+            )
+
     # Tony's bucket distribution
     try:
         bucket_query = """

@@ -13,7 +13,10 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from api import _fetch
+try:
+    from .api_core import _fetch
+except ImportError:  # pragma: no cover - script execution fallback
+    from api_core import _fetch  # type: ignore
 from config import (
     ALCHEMY_RPC_URL,
     CONFIG,
