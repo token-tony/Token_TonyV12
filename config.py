@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import re
-from typing import List
+from typing import Dict, List
 
 try:
     from dotenv import load_dotenv
@@ -46,6 +46,19 @@ USDT_MINT = "Es9vMFrzaCERzsiDMHcRWNtNeBNZ6qKqc7C6dQY9jz4"
 # Include at least SOL to avoid treating it as a new token; extend as needed with USDC/USDT.
 def _env_bool(name: str, default: str = "0") -> bool:
     return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "y"}
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
 # Base known quote mints: SOL + canonical stables for efficiency and reliability
 KNOWN_QUOTE_MINTS = {SOL_MINT, USDC_MINT, USDT_MINT}
@@ -155,6 +168,77 @@ CONFIG = {
     "PUSH_COOLDOWN_HOURS": 1,
     "COMMAND_COOLDOWN_HOURS_COMMANDS": 4,
 }
+
+# HTTP rate limiter defaults. Each entry describes steady-state requests per
+# second (``rps``), optional burst capacity and the interval length in seconds.
+# Operators can override individual providers via environment variables such as
+# ``HTTP_RATE_LIMIT_DEXSCREENER_RPS`` or adjust multiple providers at once with
+# ``HTTP_RATE_LIMIT_EXTRA="provider=5:10"`` (format: ``name=rps[:burst[:interval]]``).
+def _normalize_limit_entry(rps: float, burst: int | None, interval: float) -> Dict[str, float]:
+    rps_val = max(0.01, float(rps))
+    interval_val = max(0.001, float(interval))
+    if burst is None or burst <= 0:
+        burst_val = max(1, int(round(rps_val * interval_val * 2)))
+    else:
+        burst_val = max(1, int(burst))
+    return {"rps": rps_val, "burst": burst_val, "interval": interval_val}
+
+
+def _build_rate_limit(name: str, default_rps: float, default_burst: int, default_interval: float = 1.0) -> Dict[str, float]:
+    prefix = f"HTTP_RATE_LIMIT_{name.upper()}"
+    rps = _env_float(f"{prefix}_RPS", default_rps)
+    interval = _env_float(f"{prefix}_INTERVAL", default_interval)
+    burst = _env_int(f"{prefix}_BURST", default_burst)
+    return _normalize_limit_entry(rps, burst, interval)
+
+
+def _parse_rate_limit_overrides(raw: str) -> Dict[str, Dict[str, float]]:
+    overrides: Dict[str, Dict[str, float]] = {}
+    if not raw:
+        return overrides
+    for chunk in re.split(r"[\s,;]+", raw.strip()):
+        if not chunk:
+            continue
+        name, _, spec = chunk.partition("=")
+        if not spec:
+            continue
+        parts = [p.strip() for p in spec.split(":")]
+        if not parts or not parts[0]:
+            continue
+        try:
+            rps = float(parts[0])
+        except ValueError:
+            continue
+        burst_val = None
+        interval_val = 1.0
+        if len(parts) > 1 and parts[1]:
+            try:
+                burst_val = int(parts[1])
+            except ValueError:
+                burst_val = None
+        if len(parts) > 2 and parts[2]:
+            try:
+                interval_val = float(parts[2])
+            except ValueError:
+                interval_val = 1.0
+        key = name.strip().lower()
+        if key:
+            overrides[key] = _normalize_limit_entry(rps, burst_val, interval_val)
+    return overrides
+
+
+HTTP_PROVIDER_LIMITS: Dict[str, Dict[str, float]] = {
+    "default": _build_rate_limit("default", 10.0, 20, 1.0),
+    "dexscreener": _build_rate_limit("dexscreener", 5.0, 10, 1.0),
+    "gecko": _build_rate_limit("gecko", 3.0, 6, 1.0),
+    "helius": _build_rate_limit("helius", 8.0, 16, 1.0),
+    "solana_rpc": _build_rate_limit("solana_rpc", 6.0, 12, 1.0),
+    "syndica": _build_rate_limit("syndica", 6.0, 12, 1.0),
+    "alchemy": _build_rate_limit("alchemy", 6.0, 12, 1.0),
+    "metadata": _build_rate_limit("metadata", 4.0, 8, 1.0),
+}
+HTTP_PROVIDER_LIMITS.update(_parse_rate_limit_overrides(os.getenv("HTTP_RATE_LIMIT_EXTRA", "")))
+CONFIG["HTTP_PROVIDER_LIMITS"] = HTTP_PROVIDER_LIMITS
 
 # Enhanced optimizations from new script
 CONFIG.update({

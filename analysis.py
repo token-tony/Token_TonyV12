@@ -8,6 +8,7 @@ import httpx
 from cachetools import TTLCache
 
 from config import CONFIG, HELIUS_API_KEY
+from http_client import _fetch
 from tony_helpers.api import (_is_ipfs_uri, fetch_birdeye,
                               fetch_creator_dossier_bitquery,
                               fetch_dexscreener_by_mint,
@@ -143,7 +144,6 @@ def _score_confidence(i: Dict[str, Any]) -> float:
 
 async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = False) -> Optional[Dict[str, Any]]:
     """The heart of the analysis pipeline. Gathers all data and calculates scores."""
-    from tony_helpers.api import _fetch
     cache_key = f"{mint}:{deep_dive}";
     if cache_key in _intel_cache: return _intel_cache[cache_key]
     
@@ -244,7 +244,7 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
             if _is_ipfs_uri(metadata_uri):
                 meta_res = await fetch_ipfs_json(c, metadata_uri)
             else:
-                meta_res = await _fetch(c, metadata_uri)
+                meta_res = await _fetch(c, metadata_uri, rate_limit_key="metadata")
             if meta_res and isinstance(meta_res, dict):
                 socials = {}
                 if url := meta_res.get("external_url"): socials["Website"] = url
