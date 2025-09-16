@@ -74,6 +74,11 @@ GRADE: MOONSHOT
 QUIP: Tony just added this to his personal playlist.
 CONDITION: None
 
+[MOONSHOT_EliteScore]
+GRADE: MOONSHOT
+QUIP: Score’s north of 85 — Tony says this setup passes the sniff test with honors.
+CONDITION: score > 85
+
 [PROMISING_Decentralized]
 GRADE: PROMISING
 QUIP: The bag is spread out, nobody's holding all the cards. I like what I'm seeing.
@@ -113,6 +118,16 @@ CONDITION: None
 GRADE: PROMISING
 QUIP: Potential’s there — just waiting for the beat to drop.
 CONDITION: None
+
+[PROMISING_ScoreClimb]
+GRADE: PROMISING
+QUIP: Score creeping past 60 — Tony sees the groundwork paying off, but discipline stays on.
+CONDITION: score > 60
+
+[PROMISING_VolatilityPop]
+GRADE: PROMISING
+QUIP: 24h move’s wild — ride the swing but keep stops tighter than Tony’s fade. ⚡
+CONDITION: price_change_24h > 40
 
 [RISKY_Centralized]
 GRADE: RISKY
@@ -158,6 +173,16 @@ CONDITION: None
 GRADE: RISKY
 QUIP: Tony’s checking the exits. This one’s got party-crasher vibes.
 CONDITION: None
+
+[RISKY_LowLiquidity]
+GRADE: RISKY
+QUIP: Liquidity’s a puddle — one wrong step and you’re the exit. Tony’s tiptoeing.
+CONDITION: liquidity_usd < 5000
+
+[RISKY_DrawdownAlert]
+GRADE: RISKY
+QUIP: 24h bleed is brutal — Tony maps the exits before even cracking the door.
+CONDITION: price_change_24h < -25
 
 [RISKY_Generic9]
 GRADE: RISKY
