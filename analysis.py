@@ -8,14 +8,38 @@ import httpx
 from cachetools import TTLCache
 
 from config import CONFIG, HELIUS_API_KEY
-from tony_helpers.api import (_is_ipfs_uri, fetch_birdeye,
-                              fetch_creator_dossier_bitquery,
-                              fetch_dexscreener_by_mint,
-                              fetch_gecko_market_data, fetch_helius_asset,
-                              fetch_holders_count_via_rpc, fetch_ipfs_json,
-                              fetch_jupiter_has_route, fetch_rugcheck_score,
-                              fetch_top10_via_rpc, fetch_twitter_stats)
-from tony_helpers.db import _execute_db
+try:
+    from .api_core import (
+        _is_ipfs_uri,
+        fetch_birdeye,
+        fetch_creator_dossier_bitquery,
+        fetch_dexscreener_by_mint,
+        fetch_gecko_market_data,
+        fetch_helius_asset,
+        fetch_holders_count_via_rpc,
+        fetch_ipfs_json,
+        fetch_jupiter_has_route,
+        fetch_rugcheck_score,
+        fetch_top10_via_rpc,
+        fetch_twitter_stats,
+    )
+    from .db_core import _execute_db
+except ImportError:  # pragma: no cover - fallback when run as script
+    from api_core import (  # type: ignore
+        _is_ipfs_uri,
+        fetch_birdeye,
+        fetch_creator_dossier_bitquery,
+        fetch_dexscreener_by_mint,
+        fetch_gecko_market_data,
+        fetch_helius_asset,
+        fetch_holders_count_via_rpc,
+        fetch_ipfs_json,
+        fetch_jupiter_has_route,
+        fetch_rugcheck_score,
+        fetch_top10_via_rpc,
+        fetch_twitter_stats,
+    )
+    from db_core import _execute_db  # type: ignore
 
 log = logging.getLogger("token_tony.analysis")
 

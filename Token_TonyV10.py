@@ -29,14 +29,54 @@ from config import (ALCHEMY_RPC_URL, ALCHEMY_WS_URL, BIRDEYE_API_KEY, CONFIG,
                     TELEGRAM_TOKEN, VIP_CHAT_ID)
 from analysis import (POOL_BIRTH_CACHE, enrich_token_intel,
                       _compute_mms, _compute_score, _compute_sss)
-from api import (API_PROVIDERS, LITE_MODE_UNTIL, _fetch,
-                 extract_mint_from_check_text, fetch_birdeye,
-                 fetch_dexscreener_by_mint,
-                 fetch_dexscreener_chart, fetch_market_snapshot)
-from db import (_execute_db, get_push_message_id,
-                get_recently_served_mints, load_latest_snapshot,
-                mark_as_served, save_snapshot, setup_database,
-                set_push_message_id, upsert_token_intel)
+try:
+    from .api_core import (
+        API_HEALTH,
+        API_PROVIDERS,
+        GECKO_API_URL,
+        LITE_MODE_UNTIL,
+        _fetch,
+        extract_mint_from_check_text,
+        fetch_birdeye,
+        fetch_dexscreener_by_mint,
+        fetch_dexscreener_chart,
+        fetch_market_snapshot,
+    )
+    from .db_core import (
+        _execute_db,
+        get_push_message_id,
+        get_recently_served_mints,
+        load_latest_snapshot,
+        mark_as_served,
+        save_snapshot,
+        setup_database,
+        set_push_message_id,
+        upsert_token_intel,
+    )
+except ImportError:  # pragma: no cover - script execution fallback
+    from api_core import (  # type: ignore
+        API_HEALTH,
+        API_PROVIDERS,
+        GECKO_API_URL,
+        LITE_MODE_UNTIL,
+        _fetch,
+        extract_mint_from_check_text,
+        fetch_birdeye,
+        fetch_dexscreener_by_mint,
+        fetch_dexscreener_chart,
+        fetch_market_snapshot,
+    )
+    from db_core import (  # type: ignore
+        _execute_db,
+        get_push_message_id,
+        get_recently_served_mints,
+        load_latest_snapshot,
+        mark_as_served,
+        save_snapshot,
+        setup_database,
+        set_push_message_id,
+        upsert_token_intel,
+    )
 from reports import (
     build_full_report2,
     load_advanced_quips,
@@ -486,7 +526,6 @@ async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
     """Discover recent Raydium pools on Solana via GeckoTerminal v2.
     Endpoint: /api/v2/networks/solana/new_pools?include=base_token,quote_token,dex,network
     """
-    from api import GECKO_API_URL
     mints: set = set()
     headers = {
         "Accept": "application/json;version=20230302",
@@ -522,7 +561,6 @@ async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
 async def _discover_from_gecko_search(client: httpx.AsyncClient, query: str) -> List[str]:
     """Search pools globally and filter to Solana/Raydium."""
     mints: set = set()
-    from api import GECKO_API_URL
     from analysis import GECKO_SEARCH_CACHE
 
     headers = {
@@ -1439,8 +1477,16 @@ async def push_segment_to_chat(app: Application, chat_id: int, segment: str) -> 
                     # Unexpected edit error — try sending a fresh message
                     mid = None
         if not mid:
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            await set_push_message_id(chat_id, segment)
+            sent = await app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            try:
+                await set_push_message_id(chat_id, segment, sent.message_id)
+            except Exception:
+                log.debug("Failed to persist push message id for chat %s segment %s", chat_id, segment)
     except Exception as e:
         log.error(f"Error pushing segment {segment} to chat {chat_id}: {e}")
 
@@ -2009,7 +2055,6 @@ async def diag(u: Update, c: ContextTypes.DEFAULT_TYPE):
     
     # Tony's API health monitoring
     status_lines.append("\n**🌐 API Health Status:**")
-    from api import API_HEALTH
     for provider, stats in API_HEALTH.items():
         total = stats['success'] + stats['failure']
         if total > 0:
