@@ -40,13 +40,13 @@ See `mission.md` for the full Mission & Operating Guide.
     # OWNER_ID=000000000              # Your Telegram user ID for admin commands
     # PUBLIC_CHAT_ID=-100123456789    # Channel/chat ID for public auto-pushes
     # VIP_CHAT_ID=-100987654321       # Channel/chat ID for VIP auto-pushes
-    # HELIUS_API_KEY=...              # Improves discovery & analysis
+    # HELIUS_API_KEY=...              # Primary Solana RPC (HTTP+WS via Helius)
     # BIRDEYE_API_KEY=...             # Improves pricing/market data
     # RUGCHECK_JWT=...                # Optional for RugCheck API
+    # ALCHEMY_RPC_URL=...             # Optional HTTP RPC failover for transaction lookups
+    # SYNDICA_RPC_URL=...             # Optional HTTP RPC failover for transaction lookups
     # ALCHEMY_WS_URL=...              # Optional WS alternative for logs firehose
-    # ALCHEMY_RPC_URL=...
-    # SYNDICA_WS_URL=...
-    # SYNDICA_RPC_URL=...
+    # SYNDICA_WS_URL=...              # Optional WS alternative for logs firehose
     # LOG_KEEP_COUNT=7                # How many rotated logs to keep
     # TONY_LOG_FILE=data/tony_log.log # Where logs are written
     # DB_FILE=data/tony_memory.db     # SQLite DB location
@@ -71,9 +71,13 @@ See `mission.md` for the full Mission & Operating Guide.
     python Token_TonyV10.py
     ```
 
-The bot should now be running. Use `/start` in a DM or configure channel permissions and `/setpublic`/`/setvip` (owner only) to enable auto-pushes.
+  The bot should now be running. Use `/start` in a DM or configure channel permissions and `/setpublic`/`/setvip` (owner only) to enable auto-pushes.
 
-### Maintenance and Cleanup
+  ### RPC failover
+
+  Token Tony automatically cycles through the configured HTTP RPC endpoints when performing JSON-RPC calls (e.g., log firehose transaction lookups). Provide any combination of `HELIUS_RPC_URL` (derived from `HELIUS_API_KEY`), `SYNDICA_RPC_URL`, and `ALCHEMY_RPC_URL`; the bot will try each provider in sequence until one succeeds.
+
+  ### Maintenance and Cleanup
 - The bot runs a background maintenance worker that:
   - Prunes old snapshots/rejected rows per retention settings
   - Drops stale discovered rows to avoid backlog bloat

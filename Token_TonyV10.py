@@ -23,9 +23,9 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (Application, CommandHandler, ContextTypes,
                           filters)
 from telegram.request import HTTPXRequest
-from config import (ALCHEMY_RPC_URL, ALCHEMY_WS_URL, BIRDEYE_API_KEY, CONFIG,
-                    HELIUS_API_KEY, HELIUS_RPC_URL, HELIUS_WS_URL, KNOWN_QUOTE_MINTS,
-                    OWNER_ID, PUBLIC_CHAT_ID, SYNDICA_RPC_URL, SYNDICA_WS_URL,
+from config import (ALCHEMY_WS_URL, BIRDEYE_API_KEY, CONFIG,
+                    HELIUS_API_KEY, HELIUS_WS_URL, KNOWN_QUOTE_MINTS,
+                    OWNER_ID, PUBLIC_CHAT_ID, SYNDICA_WS_URL,
                     TELEGRAM_TOKEN, VIP_CHAT_ID)
 from analysis import (POOL_BIRTH_CACHE, enrich_token_intel,
                       _compute_mms, _compute_score, _compute_sss)
@@ -33,6 +33,7 @@ from api import (API_PROVIDERS, LITE_MODE_UNTIL, _fetch,
                  extract_mint_from_check_text, fetch_birdeye,
                  fetch_dexscreener_by_mint,
                  fetch_dexscreener_chart, fetch_market_snapshot)
+from rpc_providers import RPC_PROVIDERS, rpc_post
 from db import (_execute_db, get_push_message_id,
                 get_recently_served_mints, load_latest_snapshot,
                 mark_as_served, save_snapshot, setup_database,
@@ -359,14 +360,6 @@ async def pumpportal_worker():
 
 ## Removed legacy Pump.fun client-api worker and Helius programSubscribe variant (unused).
 
-async def _fetch_transaction(c: httpx.AsyncClient, rpc_url: str, signature: str) -> Optional[Dict[str, Any]]:
-    payload = {
-        "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-        "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-    }
-    res = await _fetch(c, rpc_url, method="POST", json=payload, timeout=10.0)
-    return (res or {}).get("result") if res else None
-
 def _extract_mints_from_tx_result(tx_result: Dict[str, Any]) -> List[str]:
     """Best-effort extraction of base/quote mints from a transaction result."""
     mints: set = set()
@@ -393,7 +386,7 @@ POOL_BIRTH_KEYWORDS = {"createpool", "initializepool", "initialize_pool", "pool-
 GO_LIVE_KEYWORDS = {"addliquidity", "increase_liquidity"}
 FLOW_KEYWORDS = {"swap"}
 
-async def _logs_subscriber(provider_name: str, ws_url: str, rpc_url: str):
+async def _logs_subscriber(provider_name: str, ws_url: str):
     key = f"Logs-{provider_name}"
     FIREHOSE_STATUS[key] = "🟡 Connecting"
     subscriptions = []
@@ -413,7 +406,6 @@ async def _logs_subscriber(provider_name: str, ws_url: str, rpc_url: str):
                     subscriptions.append(sub["id"])
                 FIREHOSE_STATUS[key] = "🟢 Connected"
                 log.info(f"✅ Logs Firehose ({provider_name}): Subscribed to {len(DEX_PROGRAMS_FOR_FIREHOSE)} programs.")
-                client = await get_http_client()
                 while websocket.open:
                         try:
                             raw = await asyncio.wait_for(websocket.recv(), timeout=90.0)
@@ -432,7 +424,30 @@ async def _logs_subscriber(provider_name: str, ws_url: str, rpc_url: str):
                                 continue
 
                             # Rate-limit transaction lookups to reduce RPC spend
-                            tx_res = await _fetch_transaction(client, rpc_url, signature)
+                            payload = {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "getTransaction",
+                                "params": [
+                                    signature,
+                                    {
+                                        "encoding": "jsonParsed",
+                                        "maxSupportedTransactionVersion": 0,
+                                    },
+                                ],
+                            }
+                            try:
+                                rpc_response = await rpc_post(payload)
+                            except Exception as e:  # noqa: BLE001
+                                log.warning(
+                                    "Logs Firehose (%s): RPC lookup for %s failed (%s)",
+                                    provider_name,
+                                    signature,
+                                    e,
+                                )
+                                continue
+
+                            tx_res = (rpc_response or {}).get("result") if rpc_response else None
                             if not tx_res:
                                 continue
                             # Optional: ignore very old transactions to avoid backfill floods
@@ -470,17 +485,20 @@ async def _logs_subscriber(provider_name: str, ws_url: str, rpc_url: str):
 async def logs_firehose_worker():
     """Start logsSubscribe firehose across configured providers (Helius/Syndica/Alchemy)."""
     providers = []
-    if HELIUS_API_KEY:
-        providers.append(("Helius", HELIUS_WS_URL, HELIUS_RPC_URL))
-    if SYNDICA_WS_URL and SYNDICA_RPC_URL:
-        providers.append(("Syndica", SYNDICA_WS_URL, SYNDICA_RPC_URL))
-    if ALCHEMY_WS_URL and ALCHEMY_RPC_URL:
-        providers.append(("Alchemy", ALCHEMY_WS_URL, ALCHEMY_RPC_URL))
+    if HELIUS_API_KEY and HELIUS_WS_URL:
+        providers.append(("Helius", HELIUS_WS_URL))
+    if SYNDICA_WS_URL:
+        providers.append(("Syndica", SYNDICA_WS_URL))
+    if ALCHEMY_WS_URL:
+        providers.append(("Alchemy", ALCHEMY_WS_URL))
     if not providers:
         log.warning("Logs Firehose disabled: no provider URLs configured (HELIUS/SYNDICA/ALCHEMY).")
         return
+    if not RPC_PROVIDERS:
+        log.warning("Logs Firehose disabled: no HTTP RPC providers configured for transaction lookups.")
+        return
     log.info(f"Logs Firehose: launching {len(providers)} providers...")
-    await asyncio.gather(*[_logs_subscriber(name, ws, http) for name, ws, http in providers])
+    await asyncio.gather(*[_logs_subscriber(name, ws) for name, ws in providers])
 
 async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
     """Discover recent Raydium pools on Solana via GeckoTerminal v2.
