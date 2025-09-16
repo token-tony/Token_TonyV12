@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import html as _html
+import math
 import random
 import re
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional
 
 from telegram.constants import ParseMode
 
-from config import OWNER_ID
+from config import CONFIG, OWNER_ID
 
 # --------------------------------------------------------------------------------------
 # Rate limiting primitives (token buckets) and Telegram outbox gating
@@ -46,26 +47,191 @@ class TokenBucket:
 
 
 class HttpRateLimiter:
-    """Endpoint/host aware limiters.
-    Define buckets by string keys; call await limit('key') before HTTP calls.
+    """Endpoint/host aware limiter with per-provider buckets.
+
+    Limits are configured via requests-per-second (``rps``), burst capacity
+    (maximum queued tokens) and an optional interval length in seconds. Each
+    provider is keyed by a short string (for example ``"dexscreener"`` or
+    ``"gecko"``) that should be supplied to :meth:`limit` before issuing an
+    outbound HTTP request.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        default_rps: float = 10.0,
+        default_burst: Optional[int] = None,
+        default_interval: float = 1.0,
+        provider_limits: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> None:
         self._buckets: Dict[str, TokenBucket] = {}
+        self._active_configs: Dict[str, tuple[int, float, float]] = {}
         self._lock = asyncio.Lock()
+        self._provider_limits: Dict[str, Dict[str, float]] = {}
 
-    async def ensure_bucket(self, key: str, capacity: int, refill: int, interval: float) -> TokenBucket:
+        self._default_rps = self._coerce_float(default_rps, 10.0, minimum=0.01)
+        self._default_interval = self._coerce_float(default_interval, 1.0, minimum=0.001)
+        fallback_burst = self._default_rps * self._default_interval * 2.0
+        self._default_burst = self._coerce_int(default_burst, fallback_burst)
+        self._default_refill = self._default_rps * self._default_interval
+        self._active_configs["default"] = (
+            self._default_burst,
+            self._default_refill,
+            self._default_interval,
+        )
+
+        if provider_limits:
+            self.configure(provider_limits)
+
+    @staticmethod
+    def _coerce_float(value: Any, fallback: float, *, minimum: Optional[float] = None) -> float:
+        try:
+            if value is None:
+                raise ValueError
+            result = float(value)
+        except (TypeError, ValueError):
+            result = float(fallback)
+        if minimum is not None:
+            result = max(minimum, result)
+        return result
+
+    @staticmethod
+    def _coerce_int(value: Any, fallback: float) -> int:
+        try:
+            if value is None:
+                raise ValueError
+            result = int(value)
+        except (TypeError, ValueError):
+            result = int(math.ceil(float(fallback)))
+        return max(1, result)
+
+    def _parse_limit_config(self, cfg: Any, *, fallback_rps: float, fallback_interval: float) -> Dict[str, float]:
+        if isinstance(cfg, Mapping):
+            data = dict(cfg)
+        else:
+            data = {"rps": cfg}
+
+        interval = self._coerce_float(data.get("interval"), fallback_interval, minimum=0.001)
+        if "refill" in data:
+            refill = self._coerce_float(data["refill"], fallback_rps * interval, minimum=0.0001)
+            rps_value = refill / interval if interval else fallback_rps
+        else:
+            rps_value = self._coerce_float(data.get("rps"), fallback_rps, minimum=0.0001)
+            refill = rps_value * interval
+
+        capacity_hint = data.get("burst", data.get("capacity", data.get("max_tokens")))
+        burst = self._coerce_int(capacity_hint, max(refill * 2.0, 1.0))
+        return {
+            "rps": rps_value,
+            "burst": burst,
+            "interval": interval,
+            "refill": refill,
+        }
+
+    def configure(self, provider_limits: Mapping[str, Any]) -> None:
+        if not provider_limits:
+            return
+
+        for raw_key, cfg in provider_limits.items():
+            if raw_key is None:
+                continue
+            key = str(raw_key).strip().lower()
+            if not key:
+                continue
+
+            normalized = self._parse_limit_config(
+                cfg, fallback_rps=self._default_rps, fallback_interval=self._default_interval
+            )
+
+            if key == "default":
+                self._default_rps = normalized["rps"]
+                self._default_interval = normalized["interval"]
+                self._default_burst = int(normalized["burst"])
+                self._default_refill = normalized["refill"]
+                self._active_configs["default"] = (
+                    self._default_burst,
+                    self._default_refill,
+                    self._default_interval,
+                )
+                if "default" in self._buckets:
+                    self._buckets["default"] = TokenBucket(
+                        self._default_burst, self._default_refill, self._default_interval
+                    )
+                continue
+
+            self._provider_limits[key] = normalized
+            self._active_configs[key] = (
+                int(normalized["burst"]),
+                float(normalized["refill"]),
+                float(normalized["interval"]),
+            )
+            if key in self._buckets:
+                self._buckets[key] = TokenBucket(*self._active_configs[key])
+
+    def _settings_for_key(self, key: str) -> tuple[int, float, float]:
+        cfg = self._provider_limits.get(key)
+        if cfg:
+            return int(cfg["burst"]), float(cfg["refill"]), float(cfg["interval"])
+        return (
+            int(self._default_burst),
+            float(self._default_refill),
+            float(self._default_interval),
+        )
+
+    async def ensure_bucket(self, key: str, capacity: int, refill: float, interval: float) -> TokenBucket:
+        capacity = self._coerce_int(capacity, capacity)
+        refill = float(refill)
+        interval = self._coerce_float(interval, self._default_interval, minimum=0.001)
         async with self._lock:
-            if key not in self._buckets:
-                self._buckets[key] = TokenBucket(capacity, refill, interval)
-            return self._buckets[key]
+            bucket = self._buckets.get(key)
+            config = (capacity, refill, interval)
+            if bucket is None or self._active_configs.get(key) != config:
+                bucket = TokenBucket(capacity, refill, interval)
+                self._buckets[key] = bucket
+                self._active_configs[key] = config
+            return bucket
 
     async def limit(self, key: str) -> None:
-        bucket = self._buckets.get(key)
-        if bucket is None:
-            # Default conservative bucket if unknown
-            bucket = await self.ensure_bucket(key, capacity=10, refill=10, interval=1.0)
+        normalized = "default"
+        if key is not None:
+            try:
+                normalized = str(key).strip().lower() or "default"
+            except Exception:
+                normalized = "default"
+
+        target = self._settings_for_key(normalized)
+        bucket = self._buckets.get(normalized)
+        if bucket is None or self._active_configs.get(normalized) != target:
+            bucket = await self.ensure_bucket(normalized, *target)
         await bucket.acquire(1.0)
+
+    def get_config(self, key: str) -> Dict[str, float]:
+        normalized = "default"
+        if key is not None:
+            try:
+                normalized = str(key).strip().lower() or "default"
+            except Exception:
+                normalized = "default"
+
+        if normalized == "default":
+            return {
+                "rps": float(self._default_rps),
+                "burst": int(self._default_burst),
+                "interval": float(self._default_interval),
+            }
+
+        cfg = self._provider_limits.get(normalized)
+        if cfg:
+            return {
+                "rps": float(cfg["rps"]),
+                "burst": int(cfg["burst"]),
+                "interval": float(cfg["interval"]),
+            }
+        return {
+            "rps": float(self._default_rps),
+            "burst": int(self._default_burst),
+            "interval": float(self._default_interval),
+        }
 
 
 class TelegramOutbox:
@@ -146,7 +312,15 @@ class TelegramOutbox:
 
 
 OUTBOX = TelegramOutbox()
-HTTP_LIMITER = HttpRateLimiter()
+
+_HTTP_LIMIT_CONFIG = CONFIG.get("HTTP_PROVIDER_LIMITS", {}) or {}
+_DEFAULT_HTTP_LIMIT = _HTTP_LIMIT_CONFIG.get("default", {})
+HTTP_LIMITER = HttpRateLimiter(
+    default_rps=_DEFAULT_HTTP_LIMIT.get("rps", 10.0),
+    default_burst=_DEFAULT_HTTP_LIMIT.get("burst"),
+    default_interval=_DEFAULT_HTTP_LIMIT.get("interval", 1.0),
+)
+HTTP_LIMITER.configure(_HTTP_LIMIT_CONFIG)
 
 # --- Telegram helpers for channel access checks ---
 async def _notify_owner(bot, text: str) -> None:

@@ -29,10 +29,11 @@ from config import (ALCHEMY_RPC_URL, ALCHEMY_WS_URL, BIRDEYE_API_KEY, CONFIG,
                     TELEGRAM_TOKEN, VIP_CHAT_ID)
 from analysis import (POOL_BIRTH_CACHE, enrich_token_intel,
                       _compute_mms, _compute_score, _compute_sss)
-from api import (API_PROVIDERS, LITE_MODE_UNTIL, _fetch,
+from api import (API_PROVIDERS, LITE_MODE_UNTIL,
                  extract_mint_from_check_text, fetch_birdeye,
                  fetch_dexscreener_by_mint,
                  fetch_dexscreener_chart, fetch_market_snapshot)
+from http_client import _fetch
 from db import (_execute_db, get_push_message_id,
                 get_recently_served_mints, load_latest_snapshot,
                 mark_as_served, save_snapshot, setup_database,
@@ -45,7 +46,7 @@ from reports import (
 )
 from utils import (_can_post_to_chat, _notify_owner,
                    is_valid_solana_address,
-                   OUTBOX, TokenBucket)
+                   OUTBOX, HTTP_LIMITER, TokenBucket)
 
 # --- Logging ---
 # Default log path moved into 'data/' to keep project root clean; override with TONY_LOG_FILE
@@ -359,12 +360,30 @@ async def pumpportal_worker():
 
 ## Removed legacy Pump.fun client-api worker and Helius programSubscribe variant (unused).
 
+def _infer_rpc_provider_key(rpc_url: str) -> str:
+    url = (rpc_url or "").lower()
+    if "helius" in url:
+        return "helius"
+    if "syndica" in url:
+        return "syndica"
+    if "alchemy" in url:
+        return "alchemy"
+    return "solana_rpc"
+
+
 async def _fetch_transaction(c: httpx.AsyncClient, rpc_url: str, signature: str) -> Optional[Dict[str, Any]]:
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
         "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
     }
-    res = await _fetch(c, rpc_url, method="POST", json=payload, timeout=10.0)
+    res = await _fetch(
+        c,
+        rpc_url,
+        method="POST",
+        json=payload,
+        timeout=10.0,
+        rate_limit_key=_infer_rpc_provider_key(rpc_url),
+    )
     return (res or {}).get("result") if res else None
 
 def _extract_mints_from_tx_result(tx_result: Dict[str, Any]) -> List[str]:
@@ -494,7 +513,7 @@ async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
     }
     url = f"{GECKO_API_URL}/networks/solana/new_pools?include=base_token,quote_token,dex,network"
     try:
-        res = await _fetch(client, url, headers=headers)
+        res = await _fetch(client, url, headers=headers, rate_limit_key="gecko")
         data = (res or {}).get("data") or []
         included = (res or {}).get("included") or []
         tok_addr = {item.get("id"): (item.get("attributes") or {}).get("address") for item in included if item.get("type") == "tokens"}
@@ -533,7 +552,7 @@ async def _discover_from_gecko_search(client: httpx.AsyncClient, query: str) -> 
     if (cached := GECKO_SEARCH_CACHE.get(url)):
         return cached
     try:
-        res = await _fetch(client, url, headers=headers)
+        res = await _fetch(client, url, headers=headers, rate_limit_key="gecko")
         data = (res or {}).get("data") or []
         included = (res or {}).get("included") or []
         tok_addr = {item.get("id"): (item.get("attributes") or {}).get("address") for item in included if item.get("type") == "tokens"}
@@ -596,6 +615,7 @@ async def discover_from_dexscreener_new_pairs(client: httpx.AsyncClient) -> List
                 ds_c = await get_http_client(ds=True)
                 # Add a tiny jitter param to avoid stale CDN edges without breaking cache keying
                 req_url = f"{base_url}?t={int(time.time()) % 7}"
+                await HTTP_LIMITER.limit("dexscreener")
                 r = await ds_c.get(req_url, headers=ds_headers, follow_redirects=True)
                 r.raise_for_status()
                 return r.json()
@@ -644,6 +664,7 @@ async def discover_from_dexscreener_search_recent(client: httpx.AsyncClient) -> 
             "Referer": "https://dexscreener.com/solana"
         }
         ds_c = await get_http_client(ds=True)
+        await HTTP_LIMITER.limit("dexscreener")
         r = await ds_c.get(url, headers=ds_headers, follow_redirects=True)
         r.raise_for_status()
         res = r.json()
