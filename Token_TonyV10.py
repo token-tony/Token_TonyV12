@@ -46,6 +46,14 @@ from reports import (
 from utils import (_can_post_to_chat, _notify_owner,
                    is_valid_solana_address,
                    OUTBOX, TokenBucket)
+from voice import (
+    cycle_voice_preset,
+    get_current_voice,
+    get_voice_label,
+    get_voice_profile,
+    list_voice_presets,
+    set_voice_preset,
+)
 
 # --- Logging ---
 # Default log path moved into 'data/' to keep project root clean; override with TONY_LOG_FILE
@@ -1975,6 +1983,76 @@ async def set_config(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Sets a configuration value."""
     await u.message.reply_text('This command is not yet implemented.')
 
+
+async def voice(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle Tony's voice presets for AI explanations and fallbacks."""
+    user_id = getattr(getattr(u, "effective_user", None), "id", None)
+    if user_id != OWNER_ID:
+        return await safe_reply_text(u, "Only the boss can change Tony's voice.")
+
+    args = list(getattr(c, "args", []) or [])
+    presets = list_voice_presets()
+    current_key = get_current_voice()
+    current_profile = get_voice_profile()
+    current_label = get_voice_label()
+    current_description = current_profile.get("description", "")
+
+    if not args:
+        options = "\n".join(
+            f"• <code>{key}</code> — {desc}" for key, desc in presets.items()
+        ) or "(no presets configured)"
+        message = (
+            "🎙️ Tony's voice is currently "
+            f"<b>{current_label}</b> (<code>{current_key}</code>).\n"
+            f"{current_description}\n\n"
+            "Available presets:\n"
+            f"{options}\n\n"
+            "Use <code>/voice &lt;preset&gt;</code> to switch or <code>/voice toggle</code> to cycle."
+        )
+        return await safe_reply_text(
+            u, message, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+
+    choice = args[0].strip().lower()
+    try:
+        if choice in {"toggle", "next"}:
+            profile = cycle_voice_preset()
+            new_key = get_current_voice()
+        else:
+            target_key = None
+            if choice in presets:
+                target_key = choice
+            else:
+                for key in presets:
+                    if key.startswith(choice):
+                        target_key = key
+                        break
+            if not target_key:
+                raise KeyError(choice)
+            profile = set_voice_preset(target_key)
+            new_key = target_key
+    except KeyError:
+        options = "\n".join(
+            f"• <code>{key}</code> — {desc}" for key, desc in presets.items()
+        ) or "(no presets configured)"
+        return await safe_reply_text(
+            u,
+            "Unknown voice preset.\n\nAvailable presets:\n" + options,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    label = profile.get("label", new_key)
+    description = profile.get("description", presets.get(new_key, ""))
+    log.info(f"🎙️ Voice preset updated to %s", new_key)
+    message = (
+        f"🎙️ Voice preset changed to <b>{label}</b> (<code>{new_key}</code>).\n"
+        f"{description}\n\nTony will use this tone for AI prompts and quips immediately."
+    )
+    return await safe_reply_text(
+        u, message, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
+
 async def diag(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Tony's comprehensive diagnostic report - everything you need to know."""
     await _maybe_send_typing(u)
@@ -2006,7 +2084,21 @@ async def diag(u: Update, c: ContextTypes.DEFAULT_TYPE):
     status_lines.append(f"• Helius: {'✅' if HELIUS_API_KEY else '❌'}")
     status_lines.append(f"• BirdEye: {'✅' if BIRDEYE_API_KEY else '❌'}")
     status_lines.append(f"• Gemini AI: {'✅' if os.getenv('GEMINI_API_KEY') else '❌'}")
-    
+
+    # Tony's voice preset overview
+    try:
+        voice_profile = get_voice_profile()
+        voice_label = get_voice_label()
+        status_lines.append("\n**🎙️ Voice Preset:**")
+        status_lines.append(
+            f"• Current tone: {voice_label} (`{get_current_voice()}`)"
+        )
+        description = voice_profile.get("description")
+        if description:
+            status_lines.append(f"• Flavor: {description}")
+    except Exception as e:
+        status_lines.append(f"\n**🎙️ Voice Preset:** Error - {e}")
+
     # Tony's API health monitoring
     status_lines.append("\n**🌐 API Health Status:**")
     from api import API_HEALTH
@@ -2465,6 +2557,7 @@ def main() -> None:
         ("kill", kill),
         ("seed", seed),
         ("set", set_config),
+        ("voice", voice),
         ("setpublic", setpublic),
         ("setvip", setvip),
         ("push", push),
@@ -2498,6 +2591,7 @@ def main() -> None:
                 'top': top, 'check': check,
                 'setpublic': setpublic, 'setvip': setvip,
                 'push': push, 'testpush': testpush,
+                'voice': voice,
             }
             
             func = command_map.get(cmd)
