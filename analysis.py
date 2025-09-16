@@ -2,7 +2,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from cachetools import TTLCache
@@ -52,79 +52,149 @@ DS_NEW_CACHE: TTLCache = TTLCache(maxsize=200, ttl=180)
 
 def _compute_sss(i: Dict[str, Any]) -> int:
     """Calculates a score based on immediate, on-chain rugpull risks."""
-    score = 80  # start lower so early coins don't auto-moon
+    cfg = CONFIG.get("SSS_SCORING", {})
+    score = float(cfg.get("base_score", 80))
+
     # Strong penalty for active authorities (but not hard zero)
-    if i.get('mint_authority') or i.get('freeze_authority'):
-        score -= 60
+    if i.get("mint_authority") or i.get("freeze_authority"):
+        score -= float(cfg.get("authority_penalty", 60))
 
-    if (pct := i.get("top10_holder_percentage")):
-        if pct >= 80: score -= 40
-        elif pct >= 60: score -= 25
-        elif pct >= 40: score -= 10
+    pct = i.get("top10_holder_percentage")
+    if pct is not None:
+        try:
+            pct_val = float(pct)
+        except (TypeError, ValueError):
+            pct_val = None
+        if pct_val is not None:
+            thresholds = cfg.get("top_holder_thresholds", [80, 60, 40])
+            penalties = cfg.get("top_holder_penalties", [40, 25, 10])
+            bucketed: List[tuple[float, float]] = []
+            for threshold, penalty in zip(thresholds, penalties):
+                try:
+                    bucketed.append((float(threshold), float(penalty)))
+                except (TypeError, ValueError):
+                    continue
+            for threshold, penalty in sorted(bucketed, key=lambda x: x[0], reverse=True):
+                if pct_val >= threshold:
+                    score -= penalty
+                    break
 
-    if (rug_score := i.get("rugcheck_score", "")):
-        if "High Risk" in rug_score: score -= 30
-    
-    if (count := i.get("creator_token_count", 0)) > 5:
-        score -= min((count * 3), 25)
+    rug_score = i.get("rugcheck_score", "")
+    if isinstance(rug_score, str) and "high risk" in rug_score.lower():
+        score -= float(cfg.get("rug_high_risk_penalty", 30))
+
+    count = i.get("creator_token_count", 0)
+    try:
+        count_val = int(count)
+    except (TypeError, ValueError):
+        count_val = 0
+    start = int(cfg.get("creator_penalty_start", 5))
+    if count_val > start:
+        per_token = float(cfg.get("creator_penalty_per_token", 3))
+        cap = float(cfg.get("creator_penalty_cap", 25))
+        penalty = min((count_val - start) * per_token, cap)
+        score -= penalty
 
     return max(0, int(score))
 
 def _compute_mms(i: Dict[str, Any]) -> int:
     """Market health with age-aware expectations."""
+    cfg = CONFIG.get("MMS_SCORING", {})
     liq = float(i.get("liquidity_usd") or 0)
     vol = float(i.get("volume_24h_usd") or 0)
     mc = float(i.get("market_cap_usd") or 0)
     age_m = float(i.get("age_minutes") or 0)
 
-    if age_m < 360:
-        liq_weight, vol_weight, mc_weight = 0.3, 0.3, 0.2
-        liq_norm, vol_norm, mc_norm = 5_000, 25_000, 50_000
-        cap = 60
-    elif age_m < 1440:
-        liq_weight, vol_weight, mc_weight = 0.35, 0.35, 0.2
-        liq_norm, vol_norm, mc_norm = 15_000, 75_000, 150_000
-        cap = 70
-    elif age_m < 10080:
-        liq_weight, vol_weight, mc_weight = 0.35, 0.35, 0.2
-        liq_norm, vol_norm, mc_norm = 50000, 200000, 500000
-        cap = 85
-    else:
-        liq_weight, vol_weight, mc_weight = 0.35, 0.35, 0.2
-        liq_norm, vol_norm, mc_norm = 150000, 400000, 1000000
-        cap = 90
+    brackets = cfg.get("age_brackets") or []
+    bracket: Dict[str, Any] = {}
+    for candidate in brackets:
+        max_age = candidate.get("max_age_minutes")
+        try:
+            max_age_val = float(max_age) if max_age is not None else None
+        except (TypeError, ValueError):
+            max_age_val = None
+        if max_age_val is None or age_m < max_age_val:
+            bracket = candidate
+            break
+    if not bracket and brackets:
+        bracket = brackets[-1]
 
-    def norm(x, k):
-        return x / (x + k) if x >= 0 else 0
+    weights = bracket.get("weights", {})
+    norms = bracket.get("norms", {})
+    liq_weight = float(weights.get("liquidity", 0.35))
+    vol_weight = float(weights.get("volume", 0.35))
+    mc_weight = float(weights.get("market_cap", 0.2))
+    liq_norm = float(norms.get("liquidity", 5_000))
+    vol_norm = float(norms.get("volume", 25_000))
+    mc_norm = float(norms.get("market_cap", 50_000))
+    cap = int(bracket.get("cap", 90))
+
+    def norm(x: float, k: float) -> float:
+        try:
+            k_val = float(k)
+        except (TypeError, ValueError):
+            k_val = 0.0
+        if x < 0:
+            return 0.0
+        if k_val <= 0:
+            return 1.0 if x > 0 else 0.0
+        return x / (x + k_val)
 
     score = 0.0
     score += liq_weight * 100 * norm(liq, liq_norm)
     score += vol_weight * 100 * norm(vol, vol_norm)
     score += mc_weight * 100 * norm(mc, mc_norm)
 
+    follower_cfg = cfg.get("twitter_followers", {})
     if (stats := i.get("twitter_stats")):
         followers = int(stats.get("followers", 0) or 0)
-        score += 10 * norm(followers, 10000)
+        weight = float(follower_cfg.get("weight", 10.0))
+        follower_norm = float(follower_cfg.get("norm", 10_000))
+        score += weight * norm(followers, follower_norm)
 
-    # Dead-market clamps: extremely low volume relative to age caps MMS regardless of MC/Liq
-    if age_m >= 1440 and vol < 1000:
-        score = min(score, 20)
-    elif age_m >= 360 and vol < 500:
-        score = min(score, 25)
-    elif vol < 100:
-        score = min(score, 15)
+    volume_clamps = cfg.get("volume_clamp_rules") or [
+        {"min_age_minutes": 1440, "max_volume": 1_000, "cap": 20},
+        {"min_age_minutes": 360, "max_volume": 500, "cap": 25},
+        {"min_age_minutes": 0, "max_volume": 100, "cap": 15},
+    ]
+    for clamp in volume_clamps:
+        try:
+            min_age = float(clamp.get("min_age_minutes", 0) or 0)
+            max_volume = float(clamp.get("max_volume", 0) or 0)
+            clamp_cap = float(clamp.get("cap", cap))
+        except (TypeError, ValueError):
+            continue
+        if age_m >= min_age and vol < max_volume:
+            score = min(score, clamp_cap)
+            break
 
-    # If price hasn't moved and volume is tiny, cap even harder (likely dead/rugged)
     try:
         pchg = abs(float(i.get("price_change_24h") or 0.0))
     except Exception:
         pchg = 0.0
-    if vol < 100 and pchg < 0.1:
-        score = min(score, 10)
+    price_cap_cfg = cfg.get("price_change_cap") or {"max_volume": 100, "max_price_change": 0.1, "cap": 10}
+    try:
+        price_cap_volume = float(price_cap_cfg.get("max_volume", 100) or 0)
+        price_cap_delta = float(price_cap_cfg.get("max_price_change", 0.1) or 0)
+        price_cap_value = float(price_cap_cfg.get("cap", 10))
+    except (TypeError, ValueError):
+        price_cap_volume = 100.0
+        price_cap_delta = 0.1
+        price_cap_value = 10.0
+    if vol < price_cap_volume and pchg < price_cap_delta:
+        score = min(score, price_cap_value)
 
-    # Liquidity-volume mismatch: large liq but near-zero volume indicates dead pool
-    if liq > 100_000 and vol < 1_000:
-        score = min(score, 20)
+    lv_cfg = cfg.get("liquidity_volume_cap") or {"min_liquidity": 100_000, "max_volume": 1_000, "cap": 20}
+    try:
+        min_liq = float(lv_cfg.get("min_liquidity", 100_000) or 0)
+        lv_max_vol = float(lv_cfg.get("max_volume", 1_000) or 0)
+        lv_cap = float(lv_cfg.get("cap", 20))
+    except (TypeError, ValueError):
+        min_liq = 100_000.0
+        lv_max_vol = 1_000.0
+        lv_cap = 20.0
+    if liq > min_liq and vol < lv_max_vol:
+        score = min(score, lv_cap)
 
     return max(0, min(int(score), cap))
 

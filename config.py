@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
+import json
 import os
 import re
-from typing import List
+from typing import Any, List
 
 try:
     from dotenv import load_dotenv
@@ -166,6 +167,71 @@ CONFIG.update({
     "INITIAL_ANALYSIS_CONCURRENCY": 10,
 })
 
+
+def _load_structured_env(name: str, default: Any) -> Any:
+    """Load JSON-based overrides for structured config defaults."""
+    raw = os.getenv(name)
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    # Return a deep copy of the default so mutations don't bleed across uses.
+    return json.loads(json.dumps(default))
+
+
+_DEFAULT_SSS_SCORING = {
+    "base_score": 80,
+    "authority_penalty": 60,
+    "top_holder_thresholds": [80, 60, 40],
+    "top_holder_penalties": [40, 25, 10],
+    "rug_high_risk_penalty": 30,
+    "creator_penalty_per_token": 3,
+    "creator_penalty_cap": 25,
+    "creator_penalty_start": 5,
+}
+
+CONFIG["SSS_SCORING"] = _load_structured_env("SSS_SCORING", _DEFAULT_SSS_SCORING)
+
+_DEFAULT_MMS_SCORING = {
+    "age_brackets": [
+        {
+            "max_age_minutes": 360,
+            "weights": {"liquidity": 0.3, "volume": 0.3, "market_cap": 0.2},
+            "norms": {"liquidity": 5_000, "volume": 25_000, "market_cap": 50_000},
+            "cap": 60,
+        },
+        {
+            "max_age_minutes": 1440,
+            "weights": {"liquidity": 0.35, "volume": 0.35, "market_cap": 0.2},
+            "norms": {"liquidity": 15_000, "volume": 75_000, "market_cap": 150_000},
+            "cap": 70,
+        },
+        {
+            "max_age_minutes": 10_080,
+            "weights": {"liquidity": 0.35, "volume": 0.35, "market_cap": 0.2},
+            "norms": {"liquidity": 50_000, "volume": 200_000, "market_cap": 500_000},
+            "cap": 85,
+        },
+        {
+            "max_age_minutes": None,
+            "weights": {"liquidity": 0.35, "volume": 0.35, "market_cap": 0.2},
+            "norms": {"liquidity": 150_000, "volume": 400_000, "market_cap": 1_000_000},
+            "cap": 90,
+        },
+    ],
+    "twitter_followers": {"weight": 10.0, "norm": 10_000},
+    "volume_clamp_rules": [
+        {"min_age_minutes": 1440, "max_volume": 1_000, "cap": 20},
+        {"min_age_minutes": 360, "max_volume": 500, "cap": 25},
+        {"min_age_minutes": 0, "max_volume": 100, "cap": 15},
+    ],
+    "price_change_cap": {"max_volume": 100, "max_price_change": 0.1, "cap": 10},
+    "liquidity_volume_cap": {"min_liquidity": 100_000, "max_volume": 1_000, "cap": 20},
+}
+
+CONFIG["MMS_SCORING"] = _load_structured_env("MMS_SCORING", _DEFAULT_MMS_SCORING)
+
 # Tony's enhanced configuration - bulletproof and comprehensive
 CONFIG.update({
     # API Reliability & Circuit Breakers
@@ -267,6 +333,30 @@ def _coerce_type(val: str, default):
             return float(val)
         except Exception:
             return default
+    if isinstance(default, list):
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return default
+        return default
+    if isinstance(default, tuple):
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, list):
+                return tuple(parsed)
+        except Exception:
+            return default
+        return default
+    if isinstance(default, dict):
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return default
+        return default
     return val
 
 for _k, _v in list(CONFIG.items()):
