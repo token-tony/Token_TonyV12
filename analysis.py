@@ -2,12 +2,13 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import httpx
 from cachetools import TTLCache
 
-from config import CONFIG, HELIUS_API_KEY
+from config import BITQUERY_API_KEY, CONFIG, HELIUS_API_KEY
+from bitquery_client import fetch_creator_history, fetch_holder_snapshot
 from tony_helpers.api import (_is_ipfs_uri, fetch_birdeye,
                               fetch_creator_dossier_bitquery,
                               fetch_dexscreener_by_mint,
@@ -26,6 +27,47 @@ GECKO_SEARCH_CACHE: TTLCache = TTLCache(maxsize=500, ttl=600)
 # Cache for DexScreener /latest/dex/pairs/solana/new endpoint results
 DS_NEW_CACHE: TTLCache = TTLCache(maxsize=200, ttl=180)
 
+
+async def _fetch_creator_history_cached(creator: str) -> Optional[Dict[str, Any]]:
+    """Bitquery-backed creator history with TTL caching."""
+    creator = (creator or "").strip()
+    if not creator:
+        return None
+
+    cache_key = f"bitq:creator:{creator.lower()}"
+    if cache_key in _intel_cache:
+        return _intel_cache[cache_key]
+
+    result = await fetch_creator_history(creator)
+    _intel_cache[cache_key] = result
+    return result
+
+
+async def _fetch_holder_snapshot_cached(
+    mint: str,
+    *,
+    supply: Optional[float],
+    insiders: Iterable[str],
+) -> Optional[Dict[str, Any]]:
+    mint = (mint or "").strip()
+    if not mint:
+        return None
+
+    normalized = sorted({(addr or "").strip().lower() for addr in insiders if addr})
+    insider_key = ",".join(normalized)
+    supply_key = f"{round(float(supply or 0.0), 6)}"
+    cache_key = f"bitq:holders:{mint.lower()}:{insider_key}:{supply_key}"
+    if cache_key in _intel_cache:
+        return _intel_cache[cache_key]
+
+    result = await fetch_holder_snapshot(
+        mint,
+        total_supply=supply,
+        insider_addresses=normalized,
+    )
+    _intel_cache[cache_key] = result
+    return result
+
 def _compute_sss(i: Dict[str, Any]) -> int:
     """Calculates a score based on immediate, on-chain rugpull risks."""
     score = 80  # start lower so early coins don't auto-moon
@@ -38,11 +80,53 @@ def _compute_sss(i: Dict[str, Any]) -> int:
         elif pct >= 60: score -= 25
         elif pct >= 40: score -= 10
 
+    if (recent_rugs := i.get("creator_recent_rug_count")):
+        if recent_rugs >= 3: score -= 45
+        elif recent_rugs == 2: score -= 35
+        elif recent_rugs == 1: score -= 20
+    elif (creator_rugs := i.get("creator_rug_count")):
+        if creator_rugs >= 6: score -= 45
+        elif creator_rugs >= 4: score -= 35
+        elif creator_rugs >= 2: score -= 25
+        elif creator_rugs >= 1: score -= 15
+
     if (rug_score := i.get("rugcheck_score", "")):
         if "High Risk" in rug_score: score -= 30
-    
+
     if (count := i.get("creator_token_count", 0)) > 5:
         score -= min((count * 3), 25)
+
+    if (total_mints := i.get("creator_total_mints")) and total_mints > 8:
+        score -= min(int(total_mints) * 2, 20)
+
+    whale_share = i.get("holder_whale_share")
+    if whale_share is not None:
+        try:
+            whale_share = float(whale_share)
+            if whale_share >= 80: score -= 35
+            elif whale_share >= 65: score -= 25
+            elif whale_share >= 50: score -= 15
+        except Exception:
+            whale_share = None
+
+    insider_share = i.get("holder_insider_share")
+    if insider_share is not None:
+        try:
+            insider_share = float(insider_share)
+            if insider_share >= 45: score -= 40
+            elif insider_share >= 30: score -= 25
+            elif insider_share >= 15: score -= 10
+        except Exception:
+            insider_share = None
+
+    retail_share = i.get("holder_retail_share")
+    if retail_share is not None:
+        try:
+            retail_share = float(retail_share)
+            if retail_share < 3: score -= 10
+            elif retail_share < 7: score -= 5
+        except Exception:
+            pass
 
     return max(0, int(score))
 
@@ -221,7 +305,12 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
 
         if token_info := core.get("token_info"):
             try:
-                supply = int(token_info.get("supply", "0"))
+                supply_raw = token_info.get("supply", "0")
+                supply = int(float(supply_raw))
+                try:
+                    intel["token_supply"] = float(supply_raw)
+                except Exception:
+                    intel["token_supply"] = float(supply)
                 holders_list = token_info.get("holders") or []
                 intel["holders_count"] = len(holders_list) if isinstance(holders_list, list) else None
                 if supply > 0 and holders_list:
@@ -320,6 +409,61 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
         hc = await fetch_holders_count_via_rpc(c, mint)
         if isinstance(hc, int) and hc > 0:
             intel["holders_count"] = hc
+
+    # Bitquery enrichment for deeper SSS context
+    bitquery_results: Dict[str, Any] = {}
+    if BITQUERY_API_KEY:
+        bitquery_tasks = {}
+        creator_addr = intel.get("creator_address")
+        if creator_addr:
+            bitquery_tasks["creator_history"] = _fetch_creator_history_cached(creator_addr)
+
+        insider_candidates = {
+            intel.get("creator_address"),
+            intel.get("mint_authority"),
+            intel.get("freeze_authority"),
+            intel.get("metadata_update_authority"),
+        }
+        bitquery_tasks["holder_snapshot"] = _fetch_holder_snapshot_cached(
+            mint,
+            supply=intel.get("token_supply"),
+            insiders=insider_candidates,
+        )
+
+        if bitquery_tasks:
+            fetched = await asyncio.gather(*bitquery_tasks.values(), return_exceptions=True)
+            bitquery_results = dict(zip(bitquery_tasks.keys(), fetched))
+
+    if bitquery_results:
+        history = bitquery_results.get("creator_history")
+        if history and not isinstance(history, Exception):
+            intel["creator_history"] = history
+            intel.setdefault("creator_token_count", history.get("total_mints"))
+            intel["creator_total_mints"] = history.get("total_mints")
+            intel["creator_rug_count"] = history.get("rugged_tokens")
+            intel["creator_recent_rug_count"] = history.get("recent_rugs")
+
+        holder_snapshot = bitquery_results.get("holder_snapshot")
+        if holder_snapshot and not isinstance(holder_snapshot, Exception):
+            intel["holder_snapshot"] = holder_snapshot
+            if intel.get("holders_count") in (None, 0):
+                hc = holder_snapshot.get("holder_count")
+                try:
+                    hc_int = int(hc)
+                except Exception:
+                    hc_int = None
+                if hc_int and hc_int > 0:
+                    intel["holders_count"] = hc_int
+            top10_share = holder_snapshot.get("top10_share")
+            if intel.get("top10_holder_percentage") is None and top10_share is not None:
+                try:
+                    intel["top10_holder_percentage"] = round(float(top10_share), 1)
+                except Exception:
+                    pass
+            intel["holder_whale_share"] = holder_snapshot.get("whale_share")
+            intel["holder_insider_share"] = holder_snapshot.get("insider_share")
+            intel["holder_retail_share"] = holder_snapshot.get("retail_share")
+            intel["holder_segments"] = holder_snapshot.get("segments")
 
     # Step 5: Deep dive if requested
     if deep_dive:
