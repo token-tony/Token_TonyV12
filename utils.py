@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import html as _html
+import logging
 import random
 import re
 import time
@@ -9,6 +10,8 @@ from typing import Any, Dict
 from telegram.constants import ParseMode
 
 from config import OWNER_ID
+
+log = logging.getLogger("token_tony.utils")
 
 # --------------------------------------------------------------------------------------
 # Rate limiting primitives (token buckets) and Telegram outbox gating
@@ -153,8 +156,8 @@ async def _notify_owner(bot, text: str) -> None:
     try:
         if OWNER_ID:
             await OUTBOX.send_text(bot, OWNER_ID, text, is_group=False, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"Owner notify failed: {e}")
 
 async def _can_post_to_chat(bot, chat_id: int) -> tuple[bool, str]:
     """Check if the bot can post to the given chat (channel/group).
