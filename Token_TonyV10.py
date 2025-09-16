@@ -46,19 +46,22 @@ from reports import (
 from utils import (_can_post_to_chat, _notify_owner,
                    is_valid_solana_address,
                    OUTBOX, TokenBucket)
+from monitoring import get_provider_metrics, record_provider_failure, record_provider_success
 
 # --- Logging ---
 # Default log path moved into 'data/' to keep project root clean; override with TONY_LOG_FILE
+log = logging.getLogger("token_tony")
 LOG_FILE = os.getenv("TONY_LOG_FILE", "data/tony_log.log")
 try:
     Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
+except Exception as e:
+    log.warning(f"Unable to prepare log directory for {LOG_FILE}: {e}")
 
 try:
     from logging.handlers import TimedRotatingFileHandler
     handlers = [TimedRotatingFileHandler(LOG_FILE, when='midnight', backupCount=7, encoding="utf-8"), logging.StreamHandler()]
-except Exception:
+except Exception as e:
+    log.debug(f"Falling back to basic log handler: {e}")
     handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()]
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s", handlers=handlers)
 log = logging.getLogger("token_tony")
@@ -383,8 +386,8 @@ def _extract_mints_from_tx_result(tx_result: Dict[str, Any]) -> List[str]:
                 info = parsed.get("info", {})
                 if mint := info.get("mint"):
                     mints.add(mint)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"Transaction parse error while extracting mints: {e}")
     # Filter out known quote mints and limit number
     filtered = [m for m in mints if m not in KNOWN_QUOTE_MINTS]
     return filtered[:4]
@@ -440,8 +443,8 @@ async def _logs_subscriber(provider_name: str, ws_url: str, rpc_url: str):
                                 bt = tx_res.get("blockTime")
                                 if bt and (time.time() - int(bt)) > 600:
                                     continue
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.debug(f"Logs Firehose ({provider_name}): blockTime parse failed for {signature}: {e}")
                             bt = tx_res.get("blockTime")
                             for mint in _extract_mints_from_tx_result(tx_res):
                                 mint = _sanitize_mint(mint)
@@ -450,8 +453,8 @@ async def _logs_subscriber(provider_name: str, ws_url: str, rpc_url: str):
                                 if bt:
                                     try:
                                         POOL_BIRTH_CACHE[mint] = int(bt)
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        log.debug(f"Logs Firehose ({provider_name}): cache store failed for {mint}: {e}")
                                 log.info(f"Logs Firehose ({provider_name}): discovered candidate mint {mint} from signature {signature}")
                                 async def _queue():
                                     await DISCOVERY_BUCKET.acquire(1)
@@ -798,21 +801,21 @@ async def update_token_tags(mint: str, intel: Dict):
     try:
         if (a := intel.get("age_minutes")) is not None:
             ages.append(float(a))
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"[{mint}] Failed to parse age_minutes: {e}")
     try:
         if (iso := intel.get("created_at_pool")):
             dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
             ages.append((datetime.now(timezone.utc) - dt).total_seconds() / 60)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"[{mint}] created_at_pool parse failed: {e}")
     try:
         row = await _execute_db("SELECT discovered_at FROM TokenLog WHERE mint_address=?", (mint,), fetch='one')
         if row and row[0]:
             ddt = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
             ages.append((datetime.now(timezone.utc) - ddt).total_seconds() / 60)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"[{mint}] Discovery time lookup failed: {e}")
     recent_age = min(ages) if ages else None
 
     # Hatching: newborn (≤ HATCHING_MAX_AGE_MINUTES) and has minimum liquidity.
@@ -929,6 +932,8 @@ async def re_analyzer_worker():
             for i, result in enumerate(results):
                 mint, old_intel_json = rows[i]
                 if isinstance(result, Exception) or not result:
+                    failure_exc = result if isinstance(result, Exception) else RuntimeError("empty market snapshot")
+                    record_provider_failure("market_snapshot", mint, failure_exc)
                     # Graceful fallback: try recent snapshot instead of dropping the token
                     try:
                         snap = await load_latest_snapshot(mint)
@@ -946,11 +951,12 @@ async def re_analyzer_worker():
                             # Do not save another snapshot (we just used an existing one)
                             log.info(f"🤖 Re-Analyzer: Used cached snapshot for {mint} (live refresh unavailable).")
                             continue
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug(f"[{mint}] Snapshot fallback failed: {e}")
                     log.warning(f"🤖 Re-Analyzer: Failed to refresh market data for {mint} (no live or cached snapshot).")
                     continue
 
+                record_provider_success("market_snapshot", mint)
                 intel = json.loads(old_intel_json)
 
                 # Recalculate age on every cycle, prefer pool creation time
@@ -967,8 +973,8 @@ async def re_analyzer_worker():
                             creation_dt = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
                     if creation_dt:
                         intel["age_minutes"] = (datetime.now(timezone.utc) - creation_dt).total_seconds() / 60
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug(f"[{mint}] Age recompute from history failed: {e}")
 
                 intel.update(result)
                 # If live result has pair_created_ms or pool_created_at, normalize into created_at_pool for tagging
@@ -981,8 +987,8 @@ async def re_analyzer_worker():
                     if pool_dt:
                         intel["created_at_pool"] = pool_dt.isoformat()
                         intel["age_minutes"] = (datetime.now(timezone.utc) - pool_dt).total_seconds() / 60
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug(f"[{mint}] Pool timestamp normalization failed: {e}")
 
                 intel["mms_score"] = _compute_mms(intel)
                 intel["score"] = _compute_score(intel)
@@ -1156,8 +1162,8 @@ async def maintenance_worker():
             # Checkpoint and truncate WAL to prevent uncontrolled growth
             try:
                 await _execute_db("PRAGMA wal_checkpoint(TRUNCATE)", commit=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Maintenance WAL checkpoint failed: {e}")
             # Drop very old 'discovered' rows to prevent backlog bloat
             try:
                 hrs = int(CONFIG.get("DISCOVERED_RETENTION_HOURS", 0) or 0)
@@ -1166,8 +1172,8 @@ async def maintenance_worker():
                         "DELETE FROM TokenLog WHERE status='discovered' AND discovered_at < datetime('now', ?)",
                         (f"-{hrs} hours",), commit=True
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Maintenance discovered-prune failed: {e}")
             # Optional full purge by age
             if (CONFIG.get("FULL_PURGE_INTERVAL_DAYS") or 0) > 0:
                 try:
@@ -1179,8 +1185,8 @@ async def maintenance_worker():
                             log.warning("DB age exceeded FULL_PURGE_INTERVAL_DAYS. Purging all state.")
                             await _db_purge_all()
                             await _execute_db("INSERT OR REPLACE INTO KeyValueStore (key, value) VALUES (?, ?)", ('last_purge_time', datetime.now(timezone.utc).isoformat()), commit=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"Maintenance purge-age check failed: {e}")
         except Exception as e:
             log.error(f"Maintenance cycle error: {e}")
         await asyncio.sleep(max(3600, int(CONFIG["MAINTENANCE_INTERVAL_HOURS"]) * 3600))
@@ -1399,8 +1405,8 @@ async def _prepare_segment_text_from_cache(segment: str) -> Tuple[Optional[str],
                     # No snapshot available => treat as lite
                     lite_mode = True
                     break
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"/{segment} lite mode snapshot check failed: {e}")
 
     header = pick_header_label(f"/{segment}")
     if lite_mode:
@@ -1426,8 +1432,8 @@ async def push_segment_to_chat(app: Application, chat_id: int, segment: str) -> 
                     if int(chat_id) < 0:
                         await (await OUTBOX._group_bucket(int(chat_id))).acquire(1)
                     await (await OUTBOX._chat_bucket(int(chat_id))).acquire(1)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug(f"Push gating acquire failed for chat {chat_id}: {e}")
                 await app.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             except Exception as e:
                 msg = str(e)
@@ -1512,8 +1518,8 @@ async def _schedule_pushes(c: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_type
         for name in (f"{chat_type}_hatching", f"{chat_type}_cooking", f"{chat_type}_top", f"{chat_type}_fresh"):
             for j in jq.get_jobs_by_name(name):
                 j.schedule_removal()
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Failed to cancel existing {chat_type} push jobs: {e}")
 
     # Recreate schedules
     if chat_id:
@@ -1593,8 +1599,8 @@ async def testpush(u: Update, c: ContextTypes.DEFAULT_TYPE):
     ch = None
     try:
         ch = await bot.get_chat(int(chat_id))
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"testpush get_chat failed for {chat_id}: {e}")
     uname = getattr(ch, 'username', None)
     typ = getattr(ch, 'type', '')
     # Send a tiny test message
@@ -1901,8 +1907,8 @@ async def check(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         if await _safe_is_group(u) and u.effective_user.id != OWNER_ID:
             return await safe_reply_text(u, "For privacy, run /check in DM with me.")
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"/check group detection failed: {e}")
     # Ensure any old ReplyKeyboard is removed (Telegram persists it otherwise)
     await safe_reply_text(u, "Running a quick scan... I’ll follow up with extras.", quote=True, reply_markup=ReplyKeyboardRemove())
     await _maybe_send_typing(u)
@@ -2021,6 +2027,30 @@ async def diag(u: Update, c: ContextTypes.DEFAULT_TYPE):
             status_lines.append(f"• {provider.title()}: {success_rate:.1f}% success, circuit {circuit_status}, last success {age_str}")
         else:
             status_lines.append(f"• {provider.title()}: No requests yet")
+
+    metrics = get_provider_metrics()
+    if metrics:
+        status_lines.append("\n**📉 Provider Reliability:**")
+        now = time.time()
+        for provider, stats in sorted(metrics.items()):
+            total = stats.failures + stats.successes
+            fail_rate = (stats.failures / total * 100) if total else 0.0
+            if stats.last_error:
+                age = int(max(0, now - stats.last_error))
+                if age < 3600:
+                    age_str = f"{age}s ago"
+                elif age < 86400:
+                    age_str = f"{age // 3600}h ago"
+                else:
+                    age_str = f"{age // 86400}d ago"
+            else:
+                age_str = "never"
+            mint_info = stats.last_mint or "n/a"
+            status_lines.append(
+                f"• {provider}: {stats.failures} fails / {stats.successes} ok ({fail_rate:.1f}% fail), last fail {age_str} [mint {mint_info}]"
+            )
+            if stats.last_exception:
+                status_lines.append(f"    ↳ {stats.last_exception}")
     
     # Tony's lite mode status
     if LITE_MODE_UNTIL > time.time():
@@ -2096,8 +2126,8 @@ async def diag(u: Update, c: ContextTypes.DEFAULT_TYPE):
             status_lines.append("\n**⚡ Performance:**")
             status_lines.append(f"• Avg processing time: {avg_time:.1f}s")
             status_lines.append(f"• Current batch size: {adaptive_batch_size}")
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"Performance metrics unavailable: {e}")
     
     report = "\n".join(status_lines)
     
@@ -2179,8 +2209,8 @@ async def dbprune(u: Update, c: ContextTypes.DEFAULT_TYPE):
     ok = await _db_prune(days_snap, days_rej)
     try:
         await _execute_db("PRAGMA wal_checkpoint(TRUNCATE)", commit=True)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"dbprune WAL checkpoint failed: {e}")
     await safe_reply_text(u, "DB prune complete." if ok else "DB prune encountered an error.")
 
 async def dbpurge(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -2215,8 +2245,8 @@ async def dbclean(u: Update, c: ContextTypes.DEFAULT_TYPE):
     ok = await _db_prune(days_snap, days_rej)
     try:
         await _execute_db("PRAGMA wal_checkpoint(TRUNCATE)", commit=True)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"dbclean WAL checkpoint failed: {e}")
     await safe_reply_text(u, wrap_with_segment_header('dbclean', "DB cleaned." if ok else "DB clean encountered an error."))
 
 async def logclean(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -2239,8 +2269,8 @@ def _cleanup_logs(keep: Optional[int] = None) -> Tuple[int, int]:
         try:
             p.unlink(missing_ok=True)
             removed += 1
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"Failed to remove log file {p}: {e}")
     return removed, min(len(rotated), keep)
 
 async def pyclean(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -2256,12 +2286,12 @@ async def pyclean(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     for p in d.rglob("*"):
                         try:
                             p.unlink()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.debug(f"pyclean file removal failed for {p}: {e}")
                     d.rmdir()
                     removed_dirs += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug(f"pyclean directory removal failed for {d}: {e}")
         await safe_reply_text(u, f"Removed {removed_dirs} __pycache__ folder(s).")
     except Exception as e:
         await safe_reply_text(u, f"pyclean error: {e}")
@@ -2380,17 +2410,17 @@ async def post_init(app: Application) -> None:
     async def weekly_maintenance_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             await _execute_db("PRAGMA wal_checkpoint(TRUNCATE)", commit=True)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Weekly maintenance WAL checkpoint failed: {e}")
         try:
             await _execute_db("VACUUM", commit=True)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Weekly maintenance VACUUM failed: {e}")
         try:
             removed, kept = _cleanup_logs()
             log.info(f"Weekly maintenance: removed {removed} logs, kept {kept} latest.")
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Weekly maintenance log cleanup failed: {e}")
 
     try:
         jq.run_daily(weekly_maintenance_job, time=dtime(3, 30, tzinfo=timezone.utc), days=(6,), name="WeeklyMaintenance")

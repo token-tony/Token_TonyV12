@@ -16,6 +16,7 @@ from tony_helpers.api import (_is_ipfs_uri, fetch_birdeye,
                               fetch_jupiter_has_route, fetch_rugcheck_score,
                               fetch_top10_via_rpc, fetch_twitter_stats)
 from tony_helpers.db import _execute_db
+from monitoring import record_provider_failure, record_provider_success
 
 log = logging.getLogger("token_tony.analysis")
 
@@ -154,9 +155,33 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
     birdeye_task = fetch_birdeye(c, mint)
     results = await asyncio.gather(helius_task, rugcheck_task, birdeye_task, return_exceptions=True)
 
-    helius_data = results[0] if not isinstance(results[0], Exception) else None
-    rugcheck_score = results[1] if not isinstance(results[1], Exception) else "N/A"
-    birdeye_raw = results[2] if not isinstance(results[2], Exception) else None
+    helius_result, rugcheck_result, birdeye_result = results
+
+    if isinstance(helius_result, Exception):
+        record_provider_failure("helius", mint, helius_result)
+        log.warning(f"[{mint}] Helius asset fetch failed: {helius_result}")
+        helius_data = None
+    else:
+        helius_data = helius_result
+        if helius_data is not None:
+            record_provider_success("helius", mint)
+
+    if isinstance(rugcheck_result, Exception):
+        record_provider_failure("rugcheck", mint, rugcheck_result)
+        log.warning(f"[{mint}] RugCheck score fetch failed: {rugcheck_result}")
+        rugcheck_score = "N/A"
+    else:
+        rugcheck_score = rugcheck_result
+        record_provider_success("rugcheck", mint)
+
+    if isinstance(birdeye_result, Exception):
+        record_provider_failure("birdeye", mint, birdeye_result)
+        log.warning(f"[{mint}] BirdEye fetch failed: {birdeye_result}")
+        birdeye_raw = None
+    else:
+        birdeye_raw = birdeye_result
+        record_provider_success("birdeye", mint)
+
     market_data = birdeye_raw
 
     # Normalize BirdEye response if present; otherwise trigger fallbacks
@@ -172,19 +197,31 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
         # If BirdEye provides holders, capture it
         try:
             int(be.get("holders")) if be.get("holders") is not None else None
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"[{mint}] BirdEye holders value not parseable: {e}")
     elif market_data:
         # BirdEye returned but with no usable data
         market_data = None
 
     # Step 2: Prefer DexScreener live data; if unavailable, use BirdEye (normalized above) or GeckoTerminal
-    try:
-        ds_now = await fetch_dexscreener_by_mint(c, mint)
-        if ds_now:
-            market_data = ds_now
-    except Exception:
-        pass
+    ds_error = None
+    for attempt in range(2):
+        try:
+            ds_now = await fetch_dexscreener_by_mint(c, mint)
+            if ds_now:
+                record_provider_success("dexscreener", mint)
+                market_data = ds_now
+                break
+            log.debug(f"[{mint}] DexScreener returned no data (attempt {attempt + 1}).")
+        except Exception as e:
+            ds_error = e
+            record_provider_failure("dexscreener", mint, e)
+            log.warning(f"[{mint}] DexScreener fetch failed (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+    else:
+        if ds_error:
+            log.debug(f"[{mint}] DexScreener exhausted retries: {ds_error}")
     if not market_data:
         log.warning(f"No DexScreener for {mint}, trying GeckoTerminal.")
         market_data = await fetch_gecko_market_data(c, mint)
@@ -235,9 +272,11 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
             try:
                 top10_res = await fetch_top10_via_rpc(c, mint)
                 if top10_res:
+                    record_provider_success("helius_rpc", mint)
                     intel.update(top10_res)
-            except Exception:
-                pass
+            except Exception as e:
+                record_provider_failure("helius_rpc", mint, e)
+                log.debug(f"[{mint}] RPC top10 fetch failed: {e}")
 
         if metadata_uri := core.get("content", {}).get("json_uri"):
             # Prefer robust IPFS resolution with gateway fallback
@@ -262,8 +301,8 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
                 hv = birdeye_raw["data"].get("holders")
                 if hv is not None:
                     intel["holders_count"] = int(hv)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"[{mint}] BirdEye holders fallback failed: {e}")
 
     # Prefer pool creation time for age if available
     if market_data and isinstance(market_data, dict):
@@ -287,8 +326,8 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
             dt = datetime.fromtimestamp(bt, tz=timezone.utc)
             intel["created_at_pool"] = dt.isoformat()
             intel["age_minutes"] = (datetime.now(timezone.utc) - dt).total_seconds() / 60
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"[{mint}] Pool birth cache lookup failed: {e}")
 
     # Ensure we always have an age estimate even without deep dive
     if "age_minutes" not in intel:
@@ -306,14 +345,16 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
     # Post-age Jupiter sanity check: only clamp if clearly untradable and not a newborn
     try:
         jup_ok = await fetch_jupiter_has_route(c, mint)
+        record_provider_success("jupiter", mint)
         # Respect grace window for very young tokens to avoid prematurely classifying as illiquid
         min_age = float(CONFIG.get("JUP_CLAMP_MIN_AGE_MINUTES", 180) or 180)
         age_m = float(intel.get("age_minutes") or 1e9)
         if jup_ok is False and age_m >= min_age:
             intel["liquidity_usd"] = 0.0
             intel["volume_24h_usd"] = 0.0
-    except Exception:
-        pass
+    except Exception as e:
+        record_provider_failure("jupiter", mint, e)
+        log.debug(f"[{mint}] Jupiter route check failed: {e}")
 
     # If still missing holders, try an RPC count (approximate)
     if intel.get("holders_count") in (None, 0) and HELIUS_API_KEY:
