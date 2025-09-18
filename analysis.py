@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import httpx
 from cachetools import TTLCache
@@ -10,6 +12,7 @@ from cachetools import TTLCache
 from config import CONFIG, HELIUS_API_KEY
 try:
     from .api_core import (
+        _fetch,
         _is_ipfs_uri,
         fetch_birdeye,
         fetch_creator_dossier_bitquery,
@@ -26,6 +29,7 @@ try:
     from .db_core import _execute_db
 except ImportError:  # pragma: no cover - fallback when run as script
     from api_core import (  # type: ignore
+        _fetch,
         _is_ipfs_uri,
         fetch_birdeye,
         fetch_creator_dossier_bitquery,
@@ -167,7 +171,6 @@ def _score_confidence(i: Dict[str, Any]) -> float:
 
 async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = False) -> Optional[Dict[str, Any]]:
     """The heart of the analysis pipeline. Gathers all data and calculates scores."""
-    from tony_helpers.api import _fetch
     cache_key = f"{mint}:{deep_dive}";
     if cache_key in _intel_cache: return _intel_cache[cache_key]
     
@@ -370,3 +373,4 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
     
     _intel_cache[cache_key] = intel
     return intel
+

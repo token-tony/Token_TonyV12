@@ -72,6 +72,16 @@ RUGCHECK_JWT = os.getenv("RUGCHECK_JWT", "").strip()
 # Add Gemini AI configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+# --- Rate Limits ---
+API_RATE_LIMITS = {
+    "birdeye": {"capacity": 1, "refill": 1, "interval": 1},
+    "dexscreener": {"capacity": 300, "refill": 300, "interval": 60},
+    "gecko": {"capacity": 30, "refill": 30, "interval": 60},
+    "helius": {"capacity": 100, "refill": 100, "interval": 1},
+    "jupiter": {"capacity": 100, "refill": 100, "interval": 1},
+    "generic": {"capacity": 10, "refill": 10, "interval": 1},
+}
+
 # --- Configuration ---
 CONFIG = {
     # Default DB path moved into 'data/' to keep project root tidy
@@ -89,11 +99,13 @@ CONFIG = {
 
     # Discovery & Analysis Settings
     "AGGREGATOR_POLL_INTERVAL_MINUTES": 1,
+    "ENABLE_BACKUP_STREAMS": True,
     # Cap discovery per poll to keep backlog manageable (0 = unlimited)
     "AGGREGATOR_MAX_NEW_PER_CYCLE": 30,
     # Global fallbacks; worker will use bucket cadences below
     "RE_ANALYZER_INTERVAL_MINUTES": 2,
-    "MIN_LIQUIDITY_FOR_HATCHING": 25, # Lowered to admit more newborns; explicit zero still excluded later
+    "FIREHOSE_SIGNATURE_CACHE": 8000,
+    "MIN_LIQUIDITY_FOR_HATCHING": 300, # Lowered to admit more newborns; explicit zero still excluded later
     # Initial analyzer throughput
     "INITIAL_ANALYZER_BATCH_SIZE": 60,
     "INDEXING_WAIT_SECONDS": 30,
@@ -101,14 +113,14 @@ CONFIG = {
     "TRIAGE_ROUTE_GRACE_MINUTES": 10,
 
     # Command Settings
-    "COMMAND_COOLDOWN_HOURS": 12,
-    "MIN_SCORE_TO_SHOW": 20, # The absolute floor score for a token to appear in any command.
+    "COMMAND_COOLDOWN_HOURS": 6,
+    "MIN_SCORE_TO_SHOW": 15, # The absolute floor score for a token to appear in any command.
     "FRESH_COMMAND_LIMIT": 2, # Standardized to 2
     "FRESH_MAX_AGE_HOURS": 24,
     "HATCHING_COMMAND_LIMIT": 2, # Standardized to 2
     # Buckets & cadences
     # Hatching: newborn (≤30m)
-    "HATCHING_MAX_AGE_MINUTES": 30,
+    "HATCHING_MAX_AGE_MINUTES": 180,
     # Per-bucket re-analysis cadence (minutes)
     "HATCHING_REANALYZE_MINUTES": 2,
     "FRESH_REANALYZE_MINUTES": 12,
@@ -116,7 +128,7 @@ CONFIG = {
     "OTHER_REANALYZE_MINUTES": 45,
     "COOKING_COMMAND_LIMIT": 2, # Standardized to 2
     # When 'cooking' tag is empty, fall back to high-volume tokens
-    "COOKING_FALLBACK_VOLUME_MIN_USD": 200,
+    "COOKING_FALLBACK_VOLUME_MIN_USD": 100,
     "TOP_COMMAND_LIMIT": 2, # Standardized to 2
     "COOKING_LOOKBACK_HOURS": 3,
     "COOKING_VOLUME_SPIKE_MULTIPLIER": 4.0,
@@ -128,13 +140,18 @@ CONFIG = {
     # Freshness & caching
     "SNAPSHOT_STALENESS_SECONDS": 1200,
     # Re-analyzer throughput control
-    "RE_ANALYZER_BATCH_LIMIT": 40,
+    "RE_ANALYZER_BATCH_LIMIT": 50,
     "RE_ANALYZER_FETCH_CONCURRENCY": 6,
     # Telegram HTTP client tuning
     "TELEGRAM_POOL_SIZE": 80,
     "TELEGRAM_POOL_TIMEOUT": 60.0,
     "TELEGRAM_CONNECT_TIMEOUT": 20.0,
     "TELEGRAM_READ_TIMEOUT": 30.0,
+    "TELEGRAM_GLOBAL_RATE_LIMIT": 30,
+    "TELEGRAM_GROUP_RATE_LIMIT": 20,
+    "TELEGRAM_GROUP_RATE_LIMIT_INTERVAL": 60,
+    "TELEGRAM_CHAT_RATE_LIMIT": 1,
+    "TELEGRAM_CHAT_RATE_LIMIT_INTERVAL": 1,
     # Don’t clamp liq to 0 on missing Jupiter routes for very young tokens (minutes)
     "JUP_CLAMP_MIN_AGE_MINUTES": 180,
     # IPFS tuning
@@ -171,9 +188,10 @@ CONFIG.update({
     # API Reliability & Circuit Breakers
     "HTTP_RETRIES": int(os.getenv("HTTP_RETRIES", "3")),
     "HTTP_TIMEOUT": float(os.getenv("HTTP_TIMEOUT", "15.0")),
-    "CIRCUIT_BREAKER_FAILURE_THRESHOLD": float(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "0.6")),
-    "CIRCUIT_BREAKER_MIN_REQUESTS": int(os.getenv("CIRCUIT_BREAKER_MIN_REQUESTS", "5")),
-    "CIRCUIT_BREAKER_RESET_TIME": int(os.getenv("CIRCUIT_BREAKER_RESET_TIME", "300")),
+    # Circuit breaker defaults tuned for noisy third-party APIs
+    "CIRCUIT_BREAKER_FAILURE_THRESHOLD": float(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "0.8")),
+    "CIRCUIT_BREAKER_MIN_REQUESTS": int(os.getenv("CIRCUIT_BREAKER_MIN_REQUESTS", "15")),
+    "CIRCUIT_BREAKER_RESET_TIME": int(os.getenv("CIRCUIT_BREAKER_RESET_TIME", "900")),
     
     # Push scheduling enhancements
     "PUSH_DUPLICATE_PREVENTION": bool(os.getenv("PUSH_DUPLICATE_PREVENTION", "1")),
@@ -309,3 +327,4 @@ def validate_config():
         warnings.append("GEMINI_API_KEY not set - AI explanations disabled")
     
     return issues, warnings
+

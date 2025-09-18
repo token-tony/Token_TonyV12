@@ -32,6 +32,11 @@ See `mission.md` for the full Mission & Operating Guide.
     pip install -r requirements.txt
     ```
 
+    The historical `tony_helpers` package that powered the API and database
+    helpers is now vendored directly in this repository (see the `tony_helpers/`
+    directory).  No extra dependency needs to be installed from PyPI – the local
+    package re-exports the same helpers that older releases used.
+
 3.  Configure Environment Variables
     Create a file named `.env` in the project root. Replace placeholders as needed.
     ```

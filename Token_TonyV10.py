@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*- 
 # Token Tony - v23.0 "The Alpha Refactor"
 # Modular, clean, and ready for the next evolution.
 
@@ -14,28 +14,47 @@ import time
 import statistics
 import re
 from datetime import datetime, timezone, time as dtime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 from pathlib import Path
+from collections import deque
 
 import httpx
 from telegram import Update, ReplyKeyboardRemove
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import (Application, CommandHandler, ContextTypes,
-                          filters)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    filters,
+)
 from telegram.request import HTTPXRequest
-from config import (ALCHEMY_WS_URL, BIRDEYE_API_KEY, CONFIG,
-                    HELIUS_API_KEY, HELIUS_WS_URL, KNOWN_QUOTE_MINTS,
-                    OWNER_ID, PUBLIC_CHAT_ID, SYNDICA_WS_URL,
-                    TELEGRAM_TOKEN, VIP_CHAT_ID)
-from analysis import (POOL_BIRTH_CACHE, enrich_token_intel,
-                      _compute_mms, _compute_score, _compute_sss)
+from config import (
+    ALCHEMY_WS_URL,
+    BIRDEYE_API_KEY,
+    CONFIG,
+    HELIUS_API_KEY,
+    HELIUS_WS_URL,
+    KNOWN_QUOTE_MINTS,
+    OWNER_ID,
+    PUBLIC_CHAT_ID,
+    SYNDICA_WS_URL,
+    TELEGRAM_TOKEN,
+    VIP_CHAT_ID,
+)
+from analysis import (
+    POOL_BIRTH_CACHE,
+    enrich_token_intel,
+    _compute_mms,
+    _compute_score,
+    _compute_sss,
+)
+from http_client import fetch, get_http_client, close_http_clients
 try:
     from .api_core import (
         API_HEALTH,
         API_PROVIDERS,
         GECKO_API_URL,
         LITE_MODE_UNTIL,
-        _fetch,
         extract_mint_from_check_text,
         fetch_birdeye,
         fetch_dexscreener_by_mint,
@@ -59,7 +78,6 @@ except ImportError:  # pragma: no cover - script execution fallback
         API_PROVIDERS,
         GECKO_API_URL,
         LITE_MODE_UNTIL,
-        _fetch,
         extract_mint_from_check_text,
         fetch_birdeye,
         fetch_dexscreener_by_mint,
@@ -154,24 +172,10 @@ if hasattr(logging, _lvl):
 # Precompiled regex for command routing
 CMD_RE = re.compile(r"^/([A-Za-z0-9_]+)(?:@\w+)?(?:\s|$)")
 
-# Shared HTTP clients to reduce TLS/connection overhead
-_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
-_HTTP_CLIENT_DS: Optional[httpx.AsyncClient] = None  # DexScreener prefers HTTP/1.1 in practice
-async def get_http_client(*, ds: bool = False) -> httpx.AsyncClient:
-    global _HTTP_CLIENT, _HTTP_CLIENT_DS
-    if ds:
-        if _HTTP_CLIENT_DS is None:
-            # Use HTTP/1.1 for DexScreener endpoints to avoid edge-caching oddities
-            _HTTP_CLIENT_DS = httpx.AsyncClient(http2=False, timeout=CONFIG["HTTP_TIMEOUT"])  # re-used across tasks
-        return _HTTP_CLIENT_DS
-    if _HTTP_CLIENT is None:
-        _HTTP_CLIENT = httpx.AsyncClient(http2=True, timeout=CONFIG["HTTP_TIMEOUT"])  # re-used across tasks
-    return _HTTP_CLIENT
-
 
 async def get_reports_by_tag(tag: str, limit: int, cooldown: set, min_score: int = 0) -> List[Dict[str, Any]]:
     """Get reports from TokenLog by tag (is_hatching_candidate, is_cooking_candidate, is_fresh_candidate)."""
-    exclude_placeholders = ','.join('?' for _ in cooldown) if cooldown else "''"
+    exclude_placeholders = ",".join("?" for _ in cooldown) if cooldown else "''"
 
     # Map tag names to column names
     tag_column_map = {
@@ -216,49 +220,46 @@ async def _refresh_reports_with_latest(reports: List[Dict[str, Any]], allow_miss
         return []
 
     refreshed = []
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-        for report in reports:
-            mint = report.get("mint")
-            if not mint:
-                if not allow_missing:
-                    continue
-                refreshed.append(report)
+    client = await get_http_client()
+    for report in reports:
+        mint = report.get("mint")
+        if not mint:
+            if not allow_missing:
                 continue
+            refreshed.append(report)
+            continue
 
-            try:
-                # Fetch fresh market snapshot
-                snapshot = await fetch_market_snapshot(client, mint)
-                if snapshot:
-                    # Update report with fresh data
-                    updated_report = report.copy()
-                    updated_report.update({
-                        "liquidity_usd": snapshot.get("liquidity_usd"),
-                        "volume_24h_usd": snapshot.get("volume_24h_usd"),
-                        "market_cap_usd": snapshot.get("market_cap_usd"),
-                        "price_change_24h": snapshot.get("price_change_24h"),
-                        "price_usd": snapshot.get("price_usd")
-                    })
+        try:
+            # Fetch fresh market snapshot
+            snapshot = await fetch_market_snapshot(mint)
+            if snapshot:
+                # Update report with fresh data
+                updated_report = report.copy()
+                updated_report.update({
+                    "liquidity_usd": snapshot.get("liquidity_usd"),
+                    "volume_24h_usd": snapshot.get("volume_24h_usd"),
+                    "market_cap_usd": snapshot.get("market_cap_usd"),
+                    "price_change_24h": snapshot.get("price_change_24h"),
+                    "price_usd": snapshot.get("price_usd")
+                })
 
-                    # Recompute scores with fresh data
-                    sss_score = _compute_sss(updated_report)
-                    mms_score = _compute_mms(updated_report)
-                    final_score = _compute_score(updated_report, sss_score, mms_score)
+                # Recompute scores with fresh data
+                sss_score = _compute_sss(updated_report)
+                mms_score = _compute_mms(updated_report)
+                updated_report["sss_score"] = sss_score
+                updated_report["mms_score"] = mms_score
+                final_score = _compute_score(updated_report)
+                updated_report["score"] = final_score
 
-                    updated_report.update({
-                        "sss_score": sss_score,
-                        "mms_score": mms_score,
-                        "score": final_score
-                    })
-
-                    refreshed.append(updated_report)
-                else:
-                    # Keep original if refresh failed but allow_missing is True
-                    if allow_missing:
-                        refreshed.append(report)
-            except Exception as e:
-                log.warning(f"Failed to refresh report for {mint}: {e}")
+                refreshed.append(updated_report)
+            else:
+                # Keep original if refresh failed but allow_missing is True
                 if allow_missing:
                     refreshed.append(report)
+        except Exception as e:
+            log.warning(f"Failed to refresh report for {mint}: {e}")
+            if allow_missing:
+                refreshed.append(report)
 
     return refreshed
 
@@ -327,12 +328,43 @@ DEX_PROGRAMS_FOR_FIREHOSE = {
     },
 }
 
+PRIMARY_PROVIDER_NAME = "Helius"
+_default_primary_programs = (
+    "Raydium_v4",
+    "Raydium_CLMM",
+    "Raydium_CPMM",
+)
+_default_backup_programs = (
+    "Raydium_v4",
+    "Raydium_CLMM",
+)
+_config_primary = CONFIG.get("PRIMARY_FIREHOSE_PROGRAMS")
+if isinstance(_config_primary, str):
+    PRIMARY_FIREHOSE_PROGRAMS = tuple(p.strip() for p in _config_primary.split(',') if p.strip())
+elif isinstance(_config_primary, (list, tuple, set)):
+    PRIMARY_FIREHOSE_PROGRAMS = tuple(str(p).strip() for p in _config_primary if str(p).strip())
+else:
+    PRIMARY_FIREHOSE_PROGRAMS = _default_primary_programs
+if not PRIMARY_FIREHOSE_PROGRAMS:
+    PRIMARY_FIREHOSE_PROGRAMS = _default_primary_programs
+_config_backup = CONFIG.get("BACKUP_FIREHOSE_PROGRAMS")
+if isinstance(_config_backup, str):
+    BACKUP_FIREHOSE_PROGRAMS = tuple(p.strip() for p in _config_backup.split(',') if p.strip())
+elif isinstance(_config_backup, (list, tuple, set)):
+    BACKUP_FIREHOSE_PROGRAMS = tuple(str(p).strip() for p in _config_backup if str(p).strip())
+else:
+    BACKUP_FIREHOSE_PROGRAMS = _default_backup_programs
+if not BACKUP_FIREHOSE_PROGRAMS:
+    BACKUP_FIREHOSE_PROGRAMS = _default_backup_programs
+_PROCESSED_SIGNATURE_LIMIT = int(CONFIG.get("FIREHOSE_SIGNATURE_CACHE", 8000) or 8000)
+_processed_signatures = deque()
+_processed_signature_set: Set[str] = set()
+
 # --- Global State ---
 FIREHOSE_STATUS: Dict[str, str] = {}
 provider_state: Dict[str, Dict[str, Any]] = {}
 PUMPFUN_STATUS = "🔴 Disconnected"
 # Adaptive processing state
-from collections import deque
 recent_processing_times = deque(maxlen=50) # Now local to this module
 adaptive_batch_size = CONFIG["MIN_BATCH_SIZE"]
 DB_MARKER_FILE = "tony_db.marker"
@@ -360,6 +392,30 @@ def _sanitize_mint(m: Optional[str]) -> Optional[str]:
                 return s2
     return s if is_valid_solana_address(s) else None
 CHANNEL_ALERT_SENT: Dict[str, bool] = {} # In-memory cache for this session
+
+
+def _primary_is_healthy() -> bool:
+    state = provider_state.get(PRIMARY_PROVIDER_NAME)
+    if not state:
+        return False
+    last_success = state.get("last_success") or 0.0
+    if not last_success or (time.time() - last_success) > 90:
+        return False
+    if state.get("current_backoff", 0.0):
+        return False
+    return True
+
+
+def _remember_signature(signature: str) -> None:
+    _processed_signatures.append(signature)
+    _processed_signature_set.add(signature)
+    if len(_processed_signatures) > _PROCESSED_SIGNATURE_LIMIT:
+        old = _processed_signatures.popleft()
+        _processed_signature_set.discard(old)
+
+
+def _signature_already_processed(signature: str) -> bool:
+    return signature in _processed_signature_set
 
 async def pumpportal_worker():
     """Single-socket PumpPortal subscriber with reconnect + resubscribe."""
@@ -440,7 +496,7 @@ POOL_BIRTH_KEYWORDS = {"createpool", "initializepool", "initialize_pool", "pool-
 GO_LIVE_KEYWORDS = {"addliquidity", "increase_liquidity"}
 FLOW_KEYWORDS = {"swap"}
 
-async def _logs_subscriber(provider_name: str, ws_url: str):
+async def _logs_subscriber(provider_name: str, ws_url: str, program_keys: Tuple[str, ...], *, is_primary: bool):
     key = f"Logs-{provider_name}"
     state = provider_state.setdefault(
         provider_name,
@@ -453,28 +509,37 @@ async def _logs_subscriber(provider_name: str, ws_url: str):
             "last_error": "",
         },
     )
-    subscriptions = []
     base_backoff = 10
     while True:
         try:
-            FIREHOSE_STATUS[key] = "🟡 Connecting"
+            FIREHOSE_STATUS[key] = "?? Connecting"
             log.info(f"Logs Firehose ({provider_name}): Connecting {ws_url} ...")
             async with websockets.connect(ws_url, ping_interval=55) as websocket:
-                for name, d in DEX_PROGRAMS_FOR_FIREHOSE.items():
+                subscriptions: List[int] = []
+                for program_name in program_keys:
+                    program = DEX_PROGRAMS_FOR_FIREHOSE.get(program_name)
+                    if not program:
+                        log.debug(f"Logs Firehose ({provider_name}): program {program_name} not configured, skipping")
+                        continue
                     sub = {
                         "jsonrpc": "2.0",
                         "id": random.randint(1000, 999999),
                         "method": "logsSubscribe",
-                        "params": [{"mentions": [d["program_id"]]}, {"commitment": "processed"}],
+                        "params": [{"mentions": [program["program_id"]]}, {"commitment": "processed"}],
                     }
                     await websocket.send(json.dumps(sub))
                     subscriptions.append(sub["id"])
+                if not subscriptions:
+                    FIREHOSE_STATUS[key] = "?? Idle"
+                    log.warning(f"Logs Firehose ({provider_name}): no programs subscribed; sleeping 30s")
+                    await asyncio.sleep(30)
+                    continue
                 state["consecutive_failures"] = 0
                 state["current_backoff"] = 0.0
                 state["last_success"] = time.time()
                 state["last_error"] = ""
-                FIREHOSE_STATUS[key] = "🟢 Connected"
-                log.info(f"✅ Logs Firehose ({provider_name}): Subscribed to {len(DEX_PROGRAMS_FOR_FIREHOSE)} programs.")
+                FIREHOSE_STATUS[key] = "?? Connected"
+                log.info(f"? Logs Firehose ({provider_name}): Subscribed to {len(subscriptions)} programs.")
                 while websocket.open:
                     try:
                         raw = await asyncio.wait_for(websocket.recv(), timeout=90.0)
@@ -497,6 +562,10 @@ async def _logs_subscriber(provider_name: str, ws_url: str):
                             provider_name,
                             state["messages_received"],
                         )
+                    if not is_primary and _primary_is_healthy():
+                        continue
+                    if _signature_already_processed(signature):
+                        continue
                     logs_list = (result.get("value", {}).get("logs") or [])
                     logs_text = "\n".join(logs_list).lower()
                     if not any(k in logs_text for k in POOL_BIRTH_KEYWORDS):
@@ -513,6 +582,7 @@ async def _logs_subscriber(provider_name: str, ws_url: str):
                         continue
                     if not tx_res:
                         continue
+                    _remember_signature(signature)
                     try:
                         bt = tx_res.get("blockTime")
                         if bt and (time.time() - int(bt)) > 600:
@@ -544,7 +614,7 @@ async def _logs_subscriber(provider_name: str, ws_url: str):
             state["last_error"] = str(e)
             backoff = min(300, base_backoff * (2 ** max(0, state["consecutive_failures"] - 1)))
             state["current_backoff"] = float(backoff)
-            FIREHOSE_STATUS[key] = f"🔴 Error: {e.__class__.__name__} (retry in {int(backoff)}s)"
+            FIREHOSE_STATUS[key] = f"?? Error: {e.__class__.__name__} (retry in {int(backoff)}s)"
             log.error(
                 "Logs Firehose (%s): connection failed after %s consecutive errors: %s. Retrying in %ss...",
                 provider_name,
@@ -557,23 +627,32 @@ async def _logs_subscriber(provider_name: str, ws_url: str):
 
 async def logs_firehose_worker():
     """Start logsSubscribe firehose across configured providers (Helius/Syndica/Alchemy)."""
-    providers = []
+    providers: List[Tuple[str, str, Tuple[str, ...], bool]] = []
     if HELIUS_API_KEY and HELIUS_WS_URL:
-        providers.append(("Helius", HELIUS_WS_URL))
-    if SYNDICA_WS_URL:
-        providers.append(("Syndica", SYNDICA_WS_URL))
-    if ALCHEMY_WS_URL:
-        providers.append(("Alchemy", ALCHEMY_WS_URL))
+        providers.append((PRIMARY_PROVIDER_NAME, HELIUS_WS_URL, PRIMARY_FIREHOSE_PROGRAMS, True))
+    enable_backups = bool(CONFIG.get("ENABLE_BACKUP_STREAMS", False))
+    if enable_backups and SYNDICA_WS_URL:
+        providers.append(("Syndica", SYNDICA_WS_URL, BACKUP_FIREHOSE_PROGRAMS, False))
+    if enable_backups and ALCHEMY_WS_URL:
+        providers.append(("Alchemy", ALCHEMY_WS_URL, BACKUP_FIREHOSE_PROGRAMS, False))
     if not providers:
         log.warning("Logs Firehose disabled: no provider URLs configured (HELIUS/SYNDICA/ALCHEMY).")
         return
     if not RPC_PROVIDERS:
         log.warning("Logs Firehose disabled: no HTTP RPC providers configured for transaction lookups.")
         return
-    log.info(f"Logs Firehose: launching {len(providers)} providers...")
-    await asyncio.gather(*[_logs_subscriber(name, ws) for name, ws in providers])
+    tasks = []
+    for name, ws, programs, is_primary in providers:
+        if not programs:
+            continue
+        tasks.append(_logs_subscriber(name, ws, programs, is_primary=is_primary))
+    if not tasks:
+        log.warning("Logs Firehose disabled: no valid program subscriptions configured.")
+        return
+    log.info(f"Logs Firehose: launching {len(tasks)} provider workers...")
+    await asyncio.gather(*tasks)
 
-async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
+async def discover_from_gecko_new_pools() -> List[str]:
     """Discover recent Raydium pools on Solana via GeckoTerminal v2.
     Endpoint: /api/v2/networks/solana/new_pools?include=base_token,quote_token,dex,network
     """
@@ -584,7 +663,7 @@ async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
     }
     url = f"{GECKO_API_URL}/networks/solana/new_pools?include=base_token,quote_token,dex,network"
     try:
-        res = await _fetch(client, url, headers=headers)
+        res = await fetch(url, headers=headers)
         data = (res or {}).get("data") or []
         included = (res or {}).get("included") or []
         tok_addr = {item.get("id"): (item.get("attributes") or {}).get("address") for item in included if item.get("type") == "tokens"}
@@ -600,7 +679,7 @@ async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
             if dex_id and dex_name.get(dex_id) and "raydium" not in dex_name.get(dex_id, ""):
                 continue
             base = tok_addr.get(base_rel.get("id"))
-            quote = tok_addr.get(quote_rel.get("id"))
+            quote = tok_addr.get(quote_rel.get("id")),
             if base and base not in KNOWN_QUOTE_MINTS:
                 mints.add(base)
             if quote and quote not in KNOWN_QUOTE_MINTS and quote != base:
@@ -609,7 +688,7 @@ async def discover_from_gecko_new_pools(client: httpx.AsyncClient) -> List[str]:
         log.warning(f"GeckoTerminal new_pools discovery failed: {e}")
     return list(mints)
 
-async def _discover_from_gecko_search(client: httpx.AsyncClient, query: str) -> List[str]:
+async def _discover_from_gecko_search(query: str) -> List[str]:
     """Search pools globally and filter to Solana/Raydium."""
     mints: set = set()
     from analysis import GECKO_SEARCH_CACHE
@@ -622,7 +701,7 @@ async def _discover_from_gecko_search(client: httpx.AsyncClient, query: str) -> 
     if (cached := GECKO_SEARCH_CACHE.get(url)):
         return cached
     try:
-        res = await _fetch(client, url, headers=headers)
+        res = await fetch(url, headers=headers)
         data = (res or {}).get("data") or []
         included = (res or {}).get("included") or []
         tok_addr = {item.get("id"): (item.get("attributes") or {}).get("address") for item in included if item.get("type") == "tokens"}
@@ -639,8 +718,8 @@ async def _discover_from_gecko_search(client: httpx.AsyncClient, query: str) -> 
                 continue
             if dex_name.get(dex_rel.get("id")) and "raydium" not in dex_name.get(dex_rel.get("id"), ""):
                 continue
-            base = tok_addr.get(base_rel.get("id"))
-            quote = tok_addr.get(quote_rel.get("id"))
+            base = tok_addr.get(base_rel.get("id")),
+            quote = tok_addr.get(quote_rel.get("id")),
             if base and base not in KNOWN_QUOTE_MINTS:
                 mints.add(base)
             if quote and quote not in KNOWN_QUOTE_MINTS and quote != base:
@@ -651,20 +730,24 @@ async def _discover_from_gecko_search(client: httpx.AsyncClient, query: str) -> 
     GECKO_SEARCH_CACHE[url] = result
     return result
 
-async def discover_from_gecko_search_pools(client: httpx.AsyncClient) -> List[str]:
+async def discover_from_gecko_search_pools() -> List[str]:
     """Search pools globally and filter to Solana/Raydium."""
-    return await _discover_from_gecko_search(client, "solana")
+    return await _discover_from_gecko_search("solana")
 
-async def discover_from_gecko_search_tokens(client: httpx.AsyncClient) -> List[str]:
+
+async def discover_from_gecko_search_tokens() -> List[str]:
     """Use GeckoTerminal search pools API (alternate query) and filter to Solana/Raydium."""
-    return await _discover_from_gecko_search(client, "bonk")
+    return await _discover_from_gecko_search("bonk")
 
-async def discover_from_dexscreener_new_pairs(client: httpx.AsyncClient) -> List[str]:
+
+async def discover_from_dexscreener_new_pairs() -> List[str]:
     """Discover recent pairs on Solana via DexScreener and resolve their mints.
+
     DexScreener occasionally returns a JSON with schemaVersion but null pairs due to edge caching.
     Mitigate with HTTP/1.1, no-cache headers, and a jittered query param to bust stale edges.
     """
     from analysis import DS_NEW_CACHE
+
     mints = set()
     base_url = "https://api.dexscreener.com/latest/dex/pairs/solana/new"
     try:
@@ -677,13 +760,12 @@ async def discover_from_dexscreener_new_pairs(client: httpx.AsyncClient) -> List
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Referer": "https://dexscreener.com/solana",
-            "Origin": "https://dexscreener.com"
+            "Origin": "https://dexscreener.com",
         }
-        # Use HTTP/1.1 for DS to reduce null responses
+
         async def _ds_get_json() -> Optional[Dict[str, Any]]:
             try:
                 ds_c = await get_http_client(ds=True)
-                # Add a tiny jitter param to avoid stale CDN edges without breaking cache keying
                 req_url = f"{base_url}?t={int(time.time()) % 7}"
                 r = await ds_c.get(req_url, headers=ds_headers, follow_redirects=True)
                 r.raise_for_status()
@@ -693,18 +775,15 @@ async def discover_from_dexscreener_new_pairs(client: httpx.AsyncClient) -> List
 
         res = await _ds_get_json()
         if not res or not (pairs := res.get("pairs")):
-            # One retry with small jitter
             await asyncio.sleep(2.0 + random.uniform(0, 0.5))
             res = await _ds_get_json()
             pairs = (res or {}).get("pairs") if res else None
             if not res or not pairs:
-                # Reduce noise: log at debug; this happens sporadically due to DS edge caching
                 if res:
                     preview = str(res)[:180]
                     log.debug(f"DexScreener /new returned null pairs. Preview: {preview}")
                 return []
-        
-        # The /new endpoint already contains the token addresses. No need for a second, redundant API call.
+
         for pair in pairs:
             if base_token := pair.get("baseToken", {}).get("address"):
                 if base_token not in KNOWN_QUOTE_MINTS:
@@ -712,6 +791,7 @@ async def discover_from_dexscreener_new_pairs(client: httpx.AsyncClient) -> List
             if quote_token := pair.get("quoteToken", {}).get("address"):
                 if quote_token not in KNOWN_QUOTE_MINTS and quote_token != base_token:
                     mints.add(quote_token)
+
         result = list(mints)
         DS_NEW_CACHE[base_url] = result
         return result
@@ -719,10 +799,8 @@ async def discover_from_dexscreener_new_pairs(client: httpx.AsyncClient) -> List
         log.warning(f"DexScreener discovery failed: {e}")
         return []
 
-# Removed broken DexScreener "recent" endpoint usage (/latest/dex/pairs/solana).
-# Use /latest/dex/search and /latest/dex/pairs/solana/new instead.
 
-async def discover_from_dexscreener_search_recent(client: httpx.AsyncClient) -> List[str]:
+async def discover_from_dexscreener_search_recent() -> List[str]:
     """Fallback: use DexScreener search API and filter Solana pairs by recent creation time."""
     mints = set()
     url = "https://api.dexscreener.com/latest/dex/search?q=solana"
@@ -730,7 +808,7 @@ async def discover_from_dexscreener_search_recent(client: httpx.AsyncClient) -> 
         ds_headers = {
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0",
-            "Referer": "https://dexscreener.com/solana"
+            "Referer": "https://dexscreener.com/solana",
         }
         ds_c = await get_http_client(ds=True)
         r = await ds_c.get(url, headers=ds_headers, follow_redirects=True)
@@ -744,7 +822,6 @@ async def discover_from_dexscreener_search_recent(client: httpx.AsyncClient) -> 
             return []
 
         now_ms = int(time.time() * 1000)
-        # Slightly wider window (10 minutes) to catch true new pairs reliably
         freshness_minutes = 10
 
         for p in pairs:
@@ -768,28 +845,29 @@ async def discover_from_dexscreener_search_recent(client: httpx.AsyncClient) -> 
                 mints.add(quote_token)
     except Exception as e:
         log.warning(f"DexScreener search discovery failed: {e}")
+        return []
     return list(mints)
 
-async def aggregator_poll_worker():
+
+
+async def aggregator_poll_worker() -> None:
     """Background worker to periodically poll aggregators for new tokens."""
     log.info("🦎 Aggregator Poller: Worker starting.")
     while True:
         try:
-            client = await get_http_client()
-            # Optional: Disable GeckoTerminal sources if they’re unstable or rate-limited
-            disable_gecko = str(os.getenv("DISABLE_GECKO", "0")).strip().lower() in {"1","true","yes","y"}
-            gecko_task = discover_from_gecko_new_pools(client) if not disable_gecko else asyncio.sleep(0)
-            gecko_search_task = discover_from_gecko_search_pools(client) if not disable_gecko else asyncio.sleep(0)
-            gecko_token_search_task = discover_from_gecko_search_tokens(client) if not disable_gecko else asyncio.sleep(0)
-            dexscreener_new_task = discover_from_dexscreener_new_pairs(client)
-            dexscreener_search_task = discover_from_dexscreener_search_recent(client)
+            disable_gecko = str(os.getenv("DISABLE_GECKO", "0")).strip().lower() in {"1", "true", "yes", "y"}
+            gecko_task = discover_from_gecko_new_pools() if not disable_gecko else asyncio.sleep(0)
+            gecko_search_task = discover_from_gecko_search_pools() if not disable_gecko else asyncio.sleep(0)
+            gecko_token_search_task = discover_from_gecko_search_tokens() if not disable_gecko else asyncio.sleep(0)
+            dexscreener_new_task = discover_from_dexscreener_new_pairs()
+            dexscreener_search_task = discover_from_dexscreener_search_recent()
             results = await asyncio.gather(
                 gecko_task,
                 gecko_search_task,
                 gecko_token_search_task,
                 dexscreener_new_task,
                 dexscreener_search_task,
-                return_exceptions=True
+                return_exceptions=True,
             )
 
             all_new_mints = set()
@@ -824,525 +902,8 @@ async def aggregator_poll_worker():
                     asyncio.create_task(_queue())
         except Exception as e:
             log.error(f"🦎 Aggregator Poller: Error during poll cycle: {e}")
-        
         await asyncio.sleep(CONFIG["AGGREGATOR_POLL_INTERVAL_MINUTES"] * 60)
 
-# ======================================================================================
-# Block 5: Dynamic Pot System & Analysis Pipeline
-# ======================================================================================
-
-async def process_discovered_token(mint: str):
-    """Single entry point for any newly discovered token from any source."""
-    try:
-        mint = _sanitize_mint(mint) or ""
-        if not is_valid_solana_address(mint) or mint in _seen_mints:
-            return
-        
-        if await _execute_db("SELECT 1 FROM TokenLog WHERE mint_address = ?", (mint,), fetch='one'):
-            return
-
-        _seen_mints.append(mint)
-        log.info(f"DISCOVERED: {mint}. Queued for initial analysis.")
-        
-        # Just insert it with 'discovered' status. The initial_analyzer_worker will pick it up.
-        await _execute_db("INSERT OR IGNORE INTO TokenLog (mint_address, status) VALUES (?, 'discovered')", (mint,), commit=True)
-    except Exception as e:
-        # This is a critical catch-all to ensure we see any errors during the very first step.
-        log.error(f"CRITICAL ERROR in process_discovered_token for mint '{mint}': {e}", exc_info=True)
-
-# Priority calculation helper (engine)
-def calculate_priority(i: Dict[str, Any]) -> int:
-    try:
-        score = float(i.get("score", 0) or 0)
-    except Exception:
-        score = 0.0
-    try:
-        liq = float(i.get("liquidity_usd", 0) or 0)
-    except Exception:
-        liq = 0.0
-    try:
-        vol = float(i.get("volume_24h_usd", 0) or 0)
-    except Exception:
-        vol = 0.0
-    try:
-        age_m = float(i.get("age_minutes", 0) or 0)
-    except Exception:
-        age_m = 0.0
-
-    def norm(x: float, k: float) -> float:
-        return x / (x + k) if x >= 0 else 0.0
-
-    pr = 0.0
-    pr += 0.6 * score
-    pr += 20.0 * norm(liq, 25_000)
-    pr += 20.0 * norm(vol, 50_000)
-    if age_m > 60:
-        pr -= min(15.0, (age_m - 60) / 60.0 * 5.0)
-    return int(max(0, min(100, pr)))
-
-async def update_token_tags(mint: str, intel: Dict):
-    """Updates the boolean candidate flags and enhanced bucket based on the latest intel."""
-    # Compute multiple age signals (minutes)
-    ages = []
-    try:
-        if (a := intel.get("age_minutes")) is not None:
-            ages.append(float(a))
-    except Exception:
-        pass
-    try:
-        if (iso := intel.get("created_at_pool")):
-            dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-            ages.append((datetime.now(timezone.utc) - dt).total_seconds() / 60)
-    except Exception:
-        pass
-    try:
-        row = await _execute_db("SELECT discovered_at FROM TokenLog WHERE mint_address=?", (mint,), fetch='one')
-        if row and row[0]:
-            ddt = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
-            ages.append((datetime.now(timezone.utc) - ddt).total_seconds() / 60)
-    except Exception:
-        pass
-    recent_age = min(ages) if ages else None
-
-    # Hatching: newborn (≤ HATCHING_MAX_AGE_MINUTES) and has minimum liquidity.
-    # If liquidity is unknown (None), allow into hatching; only exclude when explicit liq is below threshold.
-    liq_val = intel.get("liquidity_usd", None)
-    meets_liq = True if liq_val is None else (float(liq_val or 0) >= CONFIG["MIN_LIQUIDITY_FOR_HATCHING"])
-    is_hatching = (
-        (recent_age is not None and recent_age <= CONFIG["HATCHING_MAX_AGE_MINUTES"]) and
-        meets_liq
-    )
-
-    # Cooking: momentum heuristic — combine price move and minimum volume
-    try:
-        price_change = float(intel.get("price_change_24h", 0) or 0)
-    except Exception:
-        price_change = 0.0
-    try:
-        vol24h = float(intel.get("volume_24h_usd", 0) or 0)
-    except Exception:
-        vol24h = 0.0
-    vol_floor = float(CONFIG.get("COOKING_FALLBACK_VOLUME_MIN_USD", 200) or 200)
-    is_cooking = (price_change >= 15.0 and vol24h >= max(500.0, vol_floor))
-
-    # Fresh: young (≤24h)
-    is_fresh = (intel.get("age_minutes", 99999) < 24 * 60)
-
-    priority = calculate_priority(intel)
-    score = intel.get("score", 0)
-
-    bucket = "standby"
-    if priority >= 80:
-        bucket = "priority"
-    elif is_hatching:
-        bucket = "hatching"
-    elif is_fresh:
-        bucket = "fresh"
-    elif is_cooking:
-        bucket = "cooking"
-    elif score >= 70:
-        bucket = "top"
-
-    log.info(f"Updating tags for {mint}: hatching={is_hatching}, cooking={is_cooking}, fresh={is_fresh}, priority={priority}, score={score}, bucket={bucket}")
-
-    query = """
-        UPDATE TokenLog SET
-            is_hatching_candidate = ?,
-            is_cooking_candidate = ?,
-            is_fresh_candidate = ?,
-            enhanced_bucket = ?,
-            priority = ?
-        WHERE mint_address = ?
-    """
-    await _execute_db(query, (is_hatching, is_cooking, is_fresh, bucket, priority, mint), commit=True)
-
-async def re_analyzer_worker():
-    """Periodically refreshes market snapshot + retags a subset of tokens based on staleness.
-    Uses bucket-specific cadences and caps batch size to avoid network/DB overload.
-    """
-    log.info("🤖 Re-Analyzer Engine: Firing up the refresh cycle.")
-    while True:
-        try:
-            # Global pacing between cycles (seconds)
-            try:
-                _interval_sec = int(float(CONFIG.get("RE_ANALYZER_INTERVAL_MINUTES", 2) or 2) * 60)
-            except Exception:
-                _interval_sec = 120
-            # Pace the loop to avoid tight spins
-            await asyncio.sleep(max(5, _interval_sec))
-            hm = f"-{int(CONFIG['HATCHING_REANALYZE_MINUTES'])} minutes"
-            fm = f"-{int(CONFIG['FRESH_REANALYZE_MINUTES'])} minutes"
-            cm = f"-{int(CONFIG['COOKING_REANALYZE_MINUTES'])} minutes"
-            om = f"-{int(CONFIG['OTHER_REANALYZE_MINUTES'])} minutes"
-            pm = f"-{int(CONFIG['HATCHING_REANALYZE_MINUTES'])} minutes" # Priority tokens should be re-analyzed frequently, like hatching
-            limit = int(CONFIG.get("RE_ANALYZER_BATCH_LIMIT", 60))
-            # Upgraded query to use enhanced_bucket for smarter re-analysis
-            query = """
-                SELECT mint_address, intel_json
-                FROM TokenLog
-                WHERE status IN ('analyzed','served') AND (
-                    (enhanced_bucket = 'hatching' AND (last_snapshot_time IS NULL OR last_snapshot_time <= datetime('now', ?)))
-                 OR (enhanced_bucket = 'cooking' AND (last_snapshot_time IS NULL OR last_snapshot_time <= datetime('now', ?)))
-                 OR (enhanced_bucket = 'fresh' AND (last_snapshot_time IS NULL OR last_snapshot_time <= datetime('now', ?)))
-                 OR (enhanced_bucket = 'priority' AND (last_snapshot_time IS NULL OR last_snapshot_time <= datetime('now', ?)))
-                 OR (enhanced_bucket NOT IN ('hatching', 'cooking', 'fresh', 'priority') AND (last_snapshot_time IS NULL OR last_snapshot_time <= datetime('now', ?)))
-                )
-                ORDER BY
-                    CASE enhanced_bucket
-                        WHEN 'priority' THEN 0
-                        WHEN 'hatching' THEN 1
-                        WHEN 'cooking' THEN 2
-                        WHEN 'fresh' THEN 3
-                        ELSE 4
-                    END,
-                    COALESCE(last_snapshot_time, '1970-01-01') ASC
-                LIMIT ?
-            """
-            rows = await _execute_db(query, (hm, cm, fm, pm, om, limit), fetch='all')
-            if not rows: 
-                log.info("🤖 Re-Analyzer: No tokens need refresh this cycle.")
-                continue
-            log.info(f"🤖 Re-Analyzer: Starting cycle for {len(rows)} tokens...")
-
-            client = await get_http_client()
-            # Concurrently fetch market data with bounded concurrency to avoid saturating network
-            limit = int(CONFIG.get("RE_ANALYZER_FETCH_CONCURRENCY", 6))
-            sem = asyncio.Semaphore(max(1, limit))
-            async def _task(mint: str):
-                async with sem:
-                    return await fetch_market_snapshot(client, mint)
-            tasks = [_task(row[0]) for row in rows]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Process each token sequentially for DB updates to reduce write contention
-            for i, result in enumerate(results):
-                mint, old_intel_json = rows[i]
-                if isinstance(result, Exception) or not result:
-                    # Graceful fallback: try recent snapshot instead of dropping the token
-                    try:
-                        snap = await load_latest_snapshot(mint)
-                        stale_sec = int(CONFIG.get("SNAPSHOT_STALENESS_SECONDS", 600) or 600)
-                        if isinstance(snap, dict) and (snap.get("snapshot_age_sec") or 1e9) <= stale_sec:
-                            intel = json.loads(old_intel_json)
-                            for k in ("liquidity_usd", "volume_24h_usd", "market_cap_usd"):
-                                if k in snap:
-                                    intel[k] = snap[k]
-                            # Recompute scores with cached values
-                            intel["mms_score"] = _compute_mms(intel)
-                            intel["score"] = _compute_score(intel)
-                            await upsert_token_intel(mint, intel)
-                            await update_token_tags(mint, intel)
-                            # Do not save another snapshot (we just used an existing one)
-                            log.info(f"🤖 Re-Analyzer: Used cached snapshot for {mint} (live refresh unavailable).")
-                            continue
-                    except Exception:
-                        pass
-                    log.warning(f"🤖 Re-Analyzer: Failed to refresh market data for {mint} (no live or cached snapshot).")
-                    continue
-
-                intel = json.loads(old_intel_json)
-
-                # Recalculate age on every cycle, prefer pool creation time
-                try:
-                    creation_dt = None
-                    if creation_time_str := intel.get("created_at_pool"):
-                        creation_dt = datetime.fromisoformat(str(creation_time_str).replace("Z", "+00:00"))
-                    elif creation_time_str := intel.get("created_at"):
-                        creation_dt = datetime.fromisoformat(str(creation_time_str).replace("Z", "+00:00"))
-                    else:
-                        # fallback to DB discovery time
-                        row = await _execute_db("SELECT discovered_at FROM TokenLog WHERE mint_address=?", (mint,), fetch='one')
-                        if row and row[0]:
-                            creation_dt = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
-                    if creation_dt:
-                        intel["age_minutes"] = (datetime.now(timezone.utc) - creation_dt).total_seconds() / 60
-                except Exception:
-                    pass
-
-                intel.update(result)
-                # If live result has pair_created_ms or pool_created_at, normalize into created_at_pool for tagging
-                try:
-                    pool_dt = None
-                    if (ms := result.get("pair_created_ms")):
-                        pool_dt = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
-                    elif (iso := result.get("pool_created_at")):
-                        pool_dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-                    if pool_dt:
-                        intel["created_at_pool"] = pool_dt.isoformat()
-                        intel["age_minutes"] = (datetime.now(timezone.utc) - pool_dt).total_seconds() / 60
-                except Exception:
-                    pass
-
-                intel["mms_score"] = _compute_mms(intel)
-                intel["score"] = _compute_score(intel)
-
-                # Apply updates one token at a time to avoid DB lock storms
-                await upsert_token_intel(mint, intel)
-                await update_token_tags(mint, intel)
-                # Save a lightweight snapshot for quick fallbacks
-                await save_snapshot(mint, intel)
-            log.info("🤖 Re-Analyzer: Cycle complete.")
-        except Exception as e:
-            log.error(f"🤖 Re-Analyzer: Error during cycle: {e}")
-
-async def second_chance_worker():
-    """Periodically re-evaluates a few 'rejected' tokens to see if they've improved."""
-    log.info("🧐 Second Chance Protocol: Engaging the scrap heap scanner.")
-    await asyncio.sleep(120) # Initial delay
-    while True:
-        try:
-            # Look at a small, random sample of rejected tokens
-            rows = await _execute_db("SELECT mint_address FROM TokenLog WHERE status = 'rejected' ORDER BY RANDOM() LIMIT 5", fetch='all')
-            if not rows:
-                await asyncio.sleep(3600) # Nothing to do, wait an hour
-                continue
-
-            mints_to_recheck = [row[0] for row in rows]
-            log.info(f"🧐 Second Chance: Re-evaluating {len(mints_to_recheck)} rejected tokens.")
-
-            client = await get_http_client()
-            for mint in mints_to_recheck:
-                # Just do a quick, cheap market data check
-                market_data = await fetch_birdeye(client, mint)
-                # Normalize BirdEye result into unified keys if present
-                if market_data and isinstance(market_data.get("data"), dict):
-                    be = market_data["data"]
-                    market_data = {
-                        "liquidity_usd": float(be.get("liquidity", 0.0)),
-                        "market_cap_usd": float(be.get("mc", 0.0)),
-                        "volume_24h_usd": float(be.get("v24h", 0.0)),
-                        "price_change_24h": float(be.get("priceChange24h", 0.0)),
-                    }
-                if not market_data:
-                    market_data = await fetch_dexscreener_by_mint(client, mint)
-                
-                if market_data and float(market_data.get("liquidity_usd", 0) or 0) >= CONFIG["MIN_LIQUIDITY_FOR_HATCHING"]:
-                    log.info(f"🌟 REDEMPTION: {mint} now has enough liquidity! Moving back to discovery queue.")
-                    await _execute_db("UPDATE TokenLog SET status = 'discovered' WHERE mint_address = ?", (mint,), commit=True)
-                await asyncio.sleep(5) # Rate limit ourselves
-        except Exception as e:
-            log.error(f"🧐 Second Chance Worker: Error during cycle: {e}")
-        await asyncio.sleep(3600) # Run once per hour
-
-async def _process_one_initial_token(mint: str):
-    """Helper to analyze one discovered token, wait, and update its status."""
-    log.info(f"🧐 Initial Analyzer: Processing {mint}. Waiting for APIs to index...")
-    # Indexing delay is handled upstream by selecting only sufficiently old
-    # discovered rows in the processing query. Avoid per-token sleeps here.
-
-    try:
-        client = await get_http_client()
-        log.info(f"🧐 Initial Analyzer: Wait over. Starting enrichment for {mint}.")
-        intel = await enrich_token_intel(client, mint, deep_dive=False)
-
-        if not intel:
-                await _execute_db("UPDATE TokenLog SET status = 'rejected' WHERE mint_address = ?", (mint,), commit=True)
-                log.info(f"REJECTED: {mint} - Failed enrichment (no data).")
-        else:
-                await upsert_token_intel(mint, intel)
-                await update_token_tags(mint, intel)
-                if any(intel.get(k) is not None for k in ("liquidity_usd", "volume_24h_usd", "market_cap_usd")):
-                    await save_snapshot(mint, intel)
-                log.info(f"✅ ADDED TO POT: {intel.get('symbol', mint)} (Score: {intel.get('score')}, Liq: ${intel.get('liquidity_usd', 0):,.2f})")
-    except Exception as e:
-        log.error(f"🧐 Initial Analyzer: Error processing {mint}: {e}. Marking as rejected.")
-        await _execute_db("UPDATE TokenLog SET status = 'rejected' WHERE mint_address = ?", (mint,), commit=True)
-
-async def process_discovery_queue():
-    """Enhanced processing worker with adaptive batching. Replaces initial_analyzer_worker."""
-    global adaptive_batch_size
-    log.info("🚀 Blueprint Engine: Adaptive intake worker is online.")
-    await asyncio.sleep(15) # Initial delay
-
-    while True:
-        try:
-            start_time = time.time()
-
-            # Calculate adaptive batch size
-            if CONFIG["ADAPTIVE_BATCH_SIZE"] and len(recent_processing_times) >= 5:
-                avg_time = statistics.mean(recent_processing_times)
-                target_time = CONFIG["TARGET_PROCESSING_TIME"]
-
-                if avg_time < target_time * 0.7:
-                    adaptive_batch_size = min(adaptive_batch_size + 2, CONFIG["MAX_BATCH_SIZE"])
-                elif avg_time > target_time * 1.3:
-                    adaptive_batch_size = max(adaptive_batch_size - 1, CONFIG["MIN_BATCH_SIZE"])
-
-            # Gate selection on discovered_at to let indexers catch up, instead of sleeping per token
-            idx_wait = int(CONFIG.get("INDEXING_WAIT_SECONDS", 60) or 60)
-            rows = await _execute_db(
-                "SELECT mint_address FROM TokenLog WHERE status = 'discovered' AND discovered_at <= datetime('now', ?) ORDER BY discovered_at ASC LIMIT ?",
-                (f"-{idx_wait} seconds", adaptive_batch_size), fetch='all'
-            )
-
-            if not rows:
-                await asyncio.sleep(30)
-                continue
-
-            mints_to_process = [row[0] for row in rows]
-            log.info(f"Enhanced Processor: Found {len(mints_to_process)} new tokens (age≥{idx_wait}s). Processing batch...")
-
-            # Cap concurrency to avoid bursts against APIs and DB
-            conc = int(CONFIG.get("INITIAL_ANALYSIS_CONCURRENCY", 8) or 8)
-            sem = asyncio.Semaphore(max(1, conc))
-            async def _run(m: str):
-                async with sem:
-                    await _process_one_initial_token(m)
-            await asyncio.gather(*[_run(m) for m in mints_to_process])
-            
-            processing_time = time.time() - start_time
-            recent_processing_times.append(processing_time)
-            log.info(f"📊 Processed {len(mints_to_process)} tokens in {processing_time:.2f}s (batch size: {adaptive_batch_size})")
-        except Exception as e:
-            log.error(f"Enhanced processing queue error: {e}", exc_info=True)
-            await asyncio.sleep(60)
-
-# ======================================================================================
-# Block 7: Scoring, Quips & Reporting
-# ======================================================================================
-
-# === Database maintenance & owner commands ===
-
-async def _db_prune(retain_snap_days: int, retain_rejected_days: int) -> int:
-    removed = 0
-    try:
-        # Remove old snapshots
-        await _execute_db(
-            "DELETE FROM TokenSnapshots WHERE snapshot_time < datetime('now', ?)",
-            (f"-{retain_snap_days} days",), commit=True
-        )
-        # Remove old rejected tokens
-        await _execute_db(
-            "DELETE FROM TokenLog WHERE status='rejected' AND (last_analyzed_time IS NULL OR last_analyzed_time < datetime('now', ?))",
-            (f"-{retain_rejected_days} days",), commit=True
-        )
-        # VACUUM
-        await _execute_db("VACUUM", commit=True)
-        removed = 1
-    except Exception as e:
-        log.error(f"DB prune failed: {e}")
-    return removed
-
-async def _db_purge_all() -> None:
-    try:
-        await _execute_db("DELETE FROM TokenSnapshots", commit=True)
-        await _execute_db("DELETE FROM TokenLog", commit=True)
-        await _execute_db("VACUUM", commit=True)
-        # reset marker
-        try:
-            Path(DB_MARKER_FILE).write_text(datetime.now(timezone.utc).isoformat(), encoding='utf-8')
-        except Exception as e:
-            log.warning(f"VACUUM failed: {e}")
-    except Exception as e:
-        log.error(f"DB purge failed: {e}")
-
-async def maintenance_worker():
-    log.info("🧹 Maintenance Protocol: Tony's cleaning crew is on the clock.")
-    # Initialize DB marker if missing
-    while True:
-        try:
-            await _db_prune(CONFIG["SNAPSHOT_RETENTION_DAYS"], CONFIG["REJECTED_RETENTION_DAYS"])
-            # Checkpoint and truncate WAL to prevent uncontrolled growth
-            try:
-                await _execute_db("PRAGMA wal_checkpoint(TRUNCATE)", commit=True)
-            except Exception:
-                pass
-            # Drop very old 'discovered' rows to prevent backlog bloat
-            try:
-                hrs = int(CONFIG.get("DISCOVERED_RETENTION_HOURS", 0) or 0)
-                if hrs > 0:
-                    await _execute_db(
-                        "DELETE FROM TokenLog WHERE status='discovered' AND discovered_at < datetime('now', ?)",
-                        (f"-{hrs} hours",), commit=True
-                    )
-            except Exception:
-                pass
-            # Optional full purge by age
-            if (CONFIG.get("FULL_PURGE_INTERVAL_DAYS") or 0) > 0:
-                try:
-                    row = await _execute_db("SELECT value FROM KeyValueStore WHERE key = 'last_purge_time'", fetch='one')
-                    if row and row[0]:
-                        dt = datetime.fromisoformat(row[0])
-                        age_days = (datetime.now(timezone.utc) - dt).days
-                        if age_days >= int(CONFIG["FULL_PURGE_INTERVAL_DAYS"]):
-                            log.warning("DB age exceeded FULL_PURGE_INTERVAL_DAYS. Purging all state.")
-                            await _db_purge_all()
-                            await _execute_db("INSERT OR REPLACE INTO KeyValueStore (key, value) VALUES (?, ?)", ('last_purge_time', datetime.now(timezone.utc).isoformat()), commit=True)
-                except Exception:
-                    pass
-        except Exception as e:
-            log.error(f"Maintenance cycle error: {e}")
-        await asyncio.sleep(max(3600, int(CONFIG["MAINTENANCE_INTERVAL_HOURS"]) * 3600))
-
-"""Deprecated report/grade helpers (replaced by *_label/*2 variants) removed for clarity."""
-
-# --- Circuit breaker reset worker ---
-async def circuit_breaker_reset_worker():
-    """Periodically relax provider circuit breakers and decay failure counts.
-    This allows temporarily failing providers to recover without hammering them.
-    """
-    while True:
-        try:
-            for name, stats in API_PROVIDERS.items():
-                # Light decay of failure count; keep success as-is
-                fail = stats.get('failure', 0)
-                stats['failure'] = max(0, int(fail * 0.8))
-                # If circuit is open, probe by closing it after cooldown window
-                if stats.get('circuit_open'):
-                    if stats['failure'] < 10:
-                        stats['circuit_open'] = False
-                        log.info(f"Circuit reset for provider {name}.")
-        except Exception as e:
-            log.warning(f"Log cleanup failed: {e}")
-        await asyncio.sleep(120)
-
-# Removed old _confidence_bar in favor of _confidence_bar2
-
-# ======================================================================================
-# Block 8: Telegram Handlers & Main Application
-# ======================================================================================
-
-async def _safe_is_group(u: Update) -> bool:
-    try:
-        t = (u.effective_chat.type or "").lower()
-        return t in {"group", "supergroup"}
-    except Exception:
-        return False
-
-async def _maybe_send_typing(u: Update):
-    """Tony's typing indicator - with proper error handling."""
-    try:
-        if u.message and u.message.chat:
-            await u.message.chat.send_action(ChatAction.TYPING)
-    except Exception as e:
-        log.debug(f"🎭 Typing indicator failed (not critical): {e}")
-
-async def safe_reply_text(u: Update, text: str, **kwargs):
-    bot = u.get_bot()
-    chat_id = u.effective_chat.id
-    chat_type = (getattr(u.effective_chat, 'type', '') or '').lower()
-    # Map PTB's reply convenience to API fields
-    if kwargs.get("quote"):
-        kwargs["reply_to_message_id"] = getattr(getattr(u, "effective_message", None), "message_id", None)
-        kwargs.pop("quote", None)
-    # Channels don't support reply keyboards; drop reply_markup to avoid 400s
-    if chat_type == 'channel' and 'reply_markup' in kwargs:
-        kwargs.pop('reply_markup', None)
-    return await OUTBOX.send_text(bot, chat_id, text, is_group=await _safe_is_group(u), **kwargs)
-
-async def safe_reply_photo(u: Update, photo: bytes, **kwargs):
-    bot = u.get_bot()
-    chat_id = u.effective_chat.id
-    if kwargs.get("quote"):
-        kwargs["reply_to_message_id"] = getattr(getattr(u, "effective_message", None), "message_id", None)
-        kwargs.pop("quote", None)
-    return await OUTBOX.send_photo(bot, chat_id, photo, is_group=await _safe_is_group(u), **kwargs)
-
-# create_links_keyboard removed; use action_row() instead
-
-# ======================================================================================
-# Block 9: Scheduled Pushes (Public/VIP) using cache-only reads
-# ======================================================================================
 
 SEGMENT_TO_TAG = {
     'fresh': 'is_fresh_candidate',

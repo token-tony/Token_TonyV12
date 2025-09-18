@@ -8,7 +8,7 @@ from typing import Any, Dict
 
 from telegram.constants import ParseMode
 
-from config import OWNER_ID
+from config import OWNER_ID, API_RATE_LIMITS, CONFIG
 
 # --------------------------------------------------------------------------------------
 # Rate limiting primitives (token buckets) and Telegram outbox gating
@@ -53,6 +53,12 @@ class HttpRateLimiter:
     def __init__(self) -> None:
         self._buckets: Dict[str, TokenBucket] = {}
         self._lock = asyncio.Lock()
+        for provider, limits in API_RATE_LIMITS.items():
+            self._buckets[provider] = TokenBucket(
+                capacity=limits["capacity"],
+                refill_amount=limits["refill"],
+                interval_seconds=limits["interval"],
+            )
 
     async def ensure_bucket(self, key: str, capacity: int, refill: int, interval: float) -> TokenBucket:
         async with self._lock:
@@ -64,7 +70,7 @@ class HttpRateLimiter:
         bucket = self._buckets.get(key)
         if bucket is None:
             # Default conservative bucket if unknown
-            bucket = await self.ensure_bucket(key, capacity=10, refill=10, interval=1.0)
+            bucket = await self.ensure_bucket("generic", capacity=10, refill=10, interval=1.0)
         await bucket.acquire(1.0)
 
 
@@ -73,7 +79,11 @@ class TelegramOutbox:
 
     def __init__(self) -> None:
         # Global: ~30 msgs/sec
-        self.global_bucket = TokenBucket(capacity=30, refill_amount=30, interval_seconds=1.0)
+        self.global_bucket = TokenBucket(
+            capacity=CONFIG["TELEGRAM_GLOBAL_RATE_LIMIT"],
+            refill_amount=CONFIG["TELEGRAM_GLOBAL_RATE_LIMIT"],
+            interval_seconds=1.0
+        )
         self.per_chat: Dict[int, TokenBucket] = {}
         self.per_group: Dict[int, TokenBucket] = {}
         self._lock = asyncio.Lock()
@@ -82,14 +92,22 @@ class TelegramOutbox:
         async with self._lock:
             if chat_id not in self.per_chat:
                 # 1 msg/sec sustained per chat
-                self.per_chat[chat_id] = TokenBucket(capacity=1, refill_amount=1, interval_seconds=1.0)
+                self.per_chat[chat_id] = TokenBucket(
+                    capacity=CONFIG["TELEGRAM_CHAT_RATE_LIMIT"],
+                    refill_amount=CONFIG["TELEGRAM_CHAT_RATE_LIMIT"],
+                    interval_seconds=CONFIG["TELEGRAM_CHAT_RATE_LIMIT_INTERVAL"],
+                )
             return self.per_chat[chat_id]
 
     async def _group_bucket(self, chat_id: int) -> TokenBucket:
         async with self._lock:
             if chat_id not in self.per_group:
                 # 20 msgs/min per group
-                self.per_group[chat_id] = TokenBucket(capacity=20, refill_amount=20, interval_seconds=60.0)
+                self.per_group[chat_id] = TokenBucket(
+                    capacity=CONFIG["TELEGRAM_GROUP_RATE_LIMIT"],
+                    refill_amount=CONFIG["TELEGRAM_GROUP_RATE_LIMIT"],
+                    interval_seconds=CONFIG["TELEGRAM_GROUP_RATE_LIMIT_INTERVAL"],
+                )
             return self.per_group[chat_id]
 
     async def send_text(self, bot, chat_id: int, text: str, is_group: bool, **kwargs):
