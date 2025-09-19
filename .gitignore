@@ -1,2 +1,17 @@
-# Automatically created by ruff.
-*
+# Standard Python ignores
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local environment/configuration
+.env
+*.sqlite3
+*.db
+
+# OS/editor cruft
+.DS_Store
+*.swp
+
+# Runtime data artifacts
+data/*
+!data/.gitkeep

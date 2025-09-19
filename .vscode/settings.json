@@ -1,0 +1,8 @@
+{
+    "chatgpt.commentCodeLensEnabled": true,
+    "geminicodeassist.agentDebugMode": true,
+    "geminicodeassist.agentYoloMode": true,
+    "geminicodeassist.rules": "Always debug and dry run after editing. Always keep responses compact. Always keep files clean and compact. \n\n\n",
+    "geminicodeassist.verboseLogging": true,
+    "geminicodeassist.enableTelemetry": false
+}

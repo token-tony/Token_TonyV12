@@ -7,13 +7,13 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import Any, Dict, Iterable, Optional, Sequence, List, Set
 
 import aiosqlite
 
 from config import CONFIG
 
-log = logging.getLogger("tony_helpers.db")
+log = logging.getLogger("token_tony.storage")
 
 _DB: Optional[aiosqlite.Connection] = None
 _DB_LOCK = asyncio.Lock()
@@ -311,6 +311,71 @@ async def upsert_token_intel(mint: str, intel: Dict[str, Any]) -> None:
         commit=True,
     )
 
+async def get_reports_by_tag(tag: str, limit: int, cooldown: set, min_score: int = 0) -> List[Dict[str, Any]]:
+    """Get reports from TokenLog by tag (is_hatching_candidate, is_cooking_candidate, is_fresh_candidate)."""
+    exclude_placeholders = ",".join("?" for _ in cooldown) if cooldown else "''"
+
+    # Map tag names to column names
+    tag_column_map = {
+        "is_hatching_candidate": "is_hatching_candidate",
+        "is_cooking_candidate": "is_cooking_candidate",
+        "is_fresh_candidate": "is_fresh_candidate"
+    }
+
+    if tag not in tag_column_map:
+        return []
+
+    column = tag_column_map[tag]
+
+    if cooldown:
+        query = f"""
+            SELECT intel_json FROM TokenLog
+            WHERE status IN ('analyzed','served')
+            AND {column} = 1
+            AND final_score >= ?
+            AND mint_address NOT IN ({exclude_placeholders})
+            ORDER BY last_analyzed_time DESC, final_score DESC
+            LIMIT ?
+        """
+        params = (min_score, *cooldown, limit)
+    else:
+        query = f"""
+            SELECT intel_json FROM TokenLog
+            WHERE status IN ('analyzed','served')
+            AND {column} = 1
+            AND final_score >= ?
+            ORDER BY last_analyzed_time DESC, final_score DESC
+            LIMIT ?
+        """
+        params = (min_score, limit)
+
+    rows = await _execute_db(query, params, fetch='all')
+    return [json.loads(row[0]) for row in rows] if rows else []
+
+async def _db_prune(days_snap: int, days_rej: int) -> bool:
+    """Placeholder for DB pruning logic."""
+    log.warning("DB prune logic is not implemented yet.")
+    # Here you would implement the logic to delete old snapshots and rejected tokens.
+    # For example:
+    # snap_cutoff = (datetime.now(timezone.utc) - timedelta(days=days_snap)).isoformat()
+    # rej_cutoff = (datetime.now(timezone.utc) - timedelta(days=days_rej)).isoformat()
+    # await _execute_db("DELETE FROM TokenSnapshots WHERE snapshot_time < ?", (snap_cutoff,), commit=True)
+    # await _execute_db("DELETE FROM TokenLog WHERE status = 'rejected' AND discovered_at < ?", (rej_cutoff,), commit=True)
+    return True
+
+async def _db_purge_all() -> None:
+    """Placeholder for DB purge logic."""
+    log.warning("DB purge logic is not implemented yet.")
+    # Here you would implement the logic to delete all data from the tables.
+    # For example:
+    # await _execute_db("DELETE FROM TokenLog", commit=True)
+    # await _execute_db("DELETE FROM TokenSnapshots", commit=True)
+    # await _execute_db("DELETE FROM KeyValueStore", commit=True)
+    # await _execute_db("DELETE FROM PushMessages", commit=True)
+    # await _execute_db("DELETE FROM ServedHistory", commit=True)
+    # await _execute_db("VACUUM", commit=True)
+    pass
+
 
 __all__ = [
     "_execute_db",
@@ -322,4 +387,7 @@ __all__ = [
     "set_push_message_id",
     "setup_database",
     "upsert_token_intel",
+    "get_reports_by_tag",
+    "_db_prune",
+    "_db_purge_all",
 ]

@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 import os
 import re
-from typing import List
+import logging
+from typing import List, Dict, Any
+from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 try:
     from dotenv import load_dotenv
@@ -72,6 +76,16 @@ RUGCHECK_JWT = os.getenv("RUGCHECK_JWT", "").strip()
 # Add Gemini AI configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+# --- Rate Limits ---
+API_RATE_LIMITS = {
+    "birdeye": {"capacity": 1, "refill": 1, "interval": 1},
+    "dexscreener": {"capacity": 300, "refill": 300, "interval": 60},
+    "gecko": {"capacity": 30, "refill": 30, "interval": 60},
+    "helius": {"capacity": 100, "refill": 100, "interval": 1},
+    "jupiter": {"capacity": 100, "refill": 100, "interval": 1},
+    "generic": {"capacity": 10, "refill": 10, "interval": 1},
+}
+
 # --- Configuration ---
 CONFIG = {
     # Default DB path moved into 'data/' to keep project root tidy
@@ -89,11 +103,13 @@ CONFIG = {
 
     # Discovery & Analysis Settings
     "AGGREGATOR_POLL_INTERVAL_MINUTES": 1,
+    "ENABLE_BACKUP_STREAMS": True,
     # Cap discovery per poll to keep backlog manageable (0 = unlimited)
     "AGGREGATOR_MAX_NEW_PER_CYCLE": 30,
     # Global fallbacks; worker will use bucket cadences below
     "RE_ANALYZER_INTERVAL_MINUTES": 2,
-    "MIN_LIQUIDITY_FOR_HATCHING": 25, # Lowered to admit more newborns; explicit zero still excluded later
+    "FIREHOSE_SIGNATURE_CACHE": 8000,
+    "MIN_LIQUIDITY_FOR_HATCHING": 300, # Lowered to admit more newborns; explicit zero still excluded later
     # Initial analyzer throughput
     "INITIAL_ANALYZER_BATCH_SIZE": 60,
     "INDEXING_WAIT_SECONDS": 30,
@@ -101,14 +117,14 @@ CONFIG = {
     "TRIAGE_ROUTE_GRACE_MINUTES": 10,
 
     # Command Settings
-    "COMMAND_COOLDOWN_HOURS": 12,
-    "MIN_SCORE_TO_SHOW": 20, # The absolute floor score for a token to appear in any command.
+    "COMMAND_COOLDOWN_HOURS": 6,
+    "MIN_SCORE_TO_SHOW": 15, # The absolute floor score for a token to appear in any command.
     "FRESH_COMMAND_LIMIT": 2, # Standardized to 2
     "FRESH_MAX_AGE_HOURS": 24,
     "HATCHING_COMMAND_LIMIT": 2, # Standardized to 2
     # Buckets & cadences
     # Hatching: newborn (≤30m)
-    "HATCHING_MAX_AGE_MINUTES": 30,
+    "HATCHING_MAX_AGE_MINUTES": 180,
     # Per-bucket re-analysis cadence (minutes)
     "HATCHING_REANALYZE_MINUTES": 2,
     "FRESH_REANALYZE_MINUTES": 12,
@@ -116,7 +132,7 @@ CONFIG = {
     "OTHER_REANALYZE_MINUTES": 45,
     "COOKING_COMMAND_LIMIT": 2, # Standardized to 2
     # When 'cooking' tag is empty, fall back to high-volume tokens
-    "COOKING_FALLBACK_VOLUME_MIN_USD": 200,
+    "COOKING_FALLBACK_VOLUME_MIN_USD": 100,
     "TOP_COMMAND_LIMIT": 2, # Standardized to 2
     "COOKING_LOOKBACK_HOURS": 3,
     "COOKING_VOLUME_SPIKE_MULTIPLIER": 4.0,
@@ -128,13 +144,18 @@ CONFIG = {
     # Freshness & caching
     "SNAPSHOT_STALENESS_SECONDS": 1200,
     # Re-analyzer throughput control
-    "RE_ANALYZER_BATCH_LIMIT": 40,
+    "RE_ANALYZER_BATCH_LIMIT": 50,
     "RE_ANALYZER_FETCH_CONCURRENCY": 6,
     # Telegram HTTP client tuning
     "TELEGRAM_POOL_SIZE": 80,
     "TELEGRAM_POOL_TIMEOUT": 60.0,
     "TELEGRAM_CONNECT_TIMEOUT": 20.0,
     "TELEGRAM_READ_TIMEOUT": 30.0,
+    "TELEGRAM_GLOBAL_RATE_LIMIT": 30,
+    "TELEGRAM_GROUP_RATE_LIMIT": 20,
+    "TELEGRAM_GROUP_RATE_LIMIT_INTERVAL": 60,
+    "TELEGRAM_CHAT_RATE_LIMIT": 1,
+    "TELEGRAM_CHAT_RATE_LIMIT_INTERVAL": 1,
     # Don’t clamp liq to 0 on missing Jupiter routes for very young tokens (minutes)
     "JUP_CLAMP_MIN_AGE_MINUTES": 180,
     # IPFS tuning
@@ -168,38 +189,25 @@ CONFIG.update({
 
 # Tony's enhanced configuration - bulletproof and comprehensive
 CONFIG.update({
-    # API Reliability & Circuit Breakers
     "HTTP_RETRIES": int(os.getenv("HTTP_RETRIES", "3")),
     "HTTP_TIMEOUT": float(os.getenv("HTTP_TIMEOUT", "15.0")),
-    "CIRCUIT_BREAKER_FAILURE_THRESHOLD": float(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "0.6")),
-    "CIRCUIT_BREAKER_MIN_REQUESTS": int(os.getenv("CIRCUIT_BREAKER_MIN_REQUESTS", "5")),
-    "CIRCUIT_BREAKER_RESET_TIME": int(os.getenv("CIRCUIT_BREAKER_RESET_TIME", "300")),
-    
-    # Push scheduling enhancements
+    "CIRCUIT_BREAKER_FAILURE_THRESHOLD": float(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "0.8")),
+    "CIRCUIT_BREAKER_MIN_REQUESTS": int(os.getenv("CIRCUIT_BREAKER_MIN_REQUESTS", "15")),
+    "CIRCUIT_BREAKER_RESET_TIME": int(os.getenv("CIRCUIT_BREAKER_RESET_TIME", "900")),
     "PUSH_DUPLICATE_PREVENTION": bool(os.getenv("PUSH_DUPLICATE_PREVENTION", "1")),
     "PUSH_ERROR_RETRY_DELAY": int(os.getenv("PUSH_ERROR_RETRY_DELAY", "300")),
     "PUSH_MAX_BACKOFF": int(os.getenv("PUSH_MAX_BACKOFF", "300")),
-    
-    # AI Integration settings
     "GEMINI_MAX_TOKENS": int(os.getenv("GEMINI_MAX_TOKENS", "80")),
     "GEMINI_TIMEOUT": float(os.getenv("GEMINI_TIMEOUT", "10.0")),
     "AI_EXPLANATION_CACHE_TTL": int(os.getenv("AI_EXPLANATION_CACHE_TTL", "1800")),
     "AI_FALLBACK_ENABLED": bool(os.getenv("AI_FALLBACK_ENABLED", "1")),
-    
-    # Enhanced diagnostics
     "STARTUP_CONFIG_LOG": bool(os.getenv("STARTUP_CONFIG_LOG", "1")),
     "DETAILED_ERROR_LOGGING": bool(os.getenv("DETAILED_ERROR_LOGGING", "1")),
     "HEALTH_CHECK_INTERVAL": int(os.getenv("HEALTH_CHECK_INTERVAL", "300")),
-    
-    # Fast check optimization
     "QUICK_CHECK_TIMEOUT": float(os.getenv("QUICK_CHECK_TIMEOUT", "5.0")),
     "DEEP_DIVE_TIMEOUT": float(os.getenv("DEEP_DIVE_TIMEOUT", "30.0")),
-    
-    # Cache optimization
     "FETCH_CACHE_SIZE": int(os.getenv("FETCH_CACHE_SIZE", "1000")),
     "FETCH_CACHE_TTL": int(os.getenv("FETCH_CACHE_TTL", "300")),
-    
-    # Maintenance settings
     "LOG_KEEP_COUNT": int(os.getenv("LOG_KEEP_COUNT", "7")),
     "WEEKLY_MAINTENANCE_ENABLED": bool(os.getenv("WEEKLY_MAINTENANCE_ENABLED", "1")),
 })
@@ -309,3 +317,50 @@ def validate_config():
         warnings.append("GEMINI_API_KEY not set - AI explanations disabled")
     
     return issues, warnings
+
+def _path_writable(p: str) -> bool:
+    try:
+        d = Path(p).parent
+        d.mkdir(parents=True, exist_ok=True)
+        test = d / ".tt_write_test.tmp"
+        test.write_text("ok", encoding="utf-8")
+        try:
+            test.unlink()
+        except Exception as e:
+            log.warning(f"WAL checkpoint failed: {e}")
+        return True
+    except Exception as e:
+        log.warning(f"Path not writable: {p} ({e})")
+        return False
+
+def is_degraded_mode() -> bool:
+    """Degraded when critical data sources are missing."""
+    return not bool(HELIUS_API_KEY) or not bool(BIRDEYE_API_KEY)
+
+def compute_config_sanity() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    out["telegram_token"] = bool(TELEGRAM_TOKEN)
+    out["db_writable"] = _path_writable(CONFIG.get("DB_FILE", "data/tony_memory.db"))
+    out["log_writable"] = _path_writable(LOG_FILE)
+    out["helius_api"] = bool(HELIUS_API_KEY)
+    out["birdeye_api"] = bool(BIRDEYE_API_KEY)
+    out["public_chat_id"] = int(PUBLIC_CHAT_ID or 0)
+    out["vip_chat_id"] = int(VIP_CHAT_ID or 0)
+    out["ws_endpoints"] = {
+        "helius_ws": bool(HELIUS_WS_URL),
+        "alchemy_ws": bool(ALCHEMY_WS_URL),
+        "syndica_ws": bool(SYNDICA_WS_URL),
+    }
+    out["degraded_mode"] = is_degraded_mode()
+    return out
+
+def log_startup_config():
+    """Tony's startup config summary - he likes to know what he's working with."""
+    log.info("🚀 Tony's Configuration Summary:")
+    log.info(f"  Database: {CONFIG.get('DB_FILE', 'data/tony_memory.db')}")
+    log.info(f"  Log file: {CONFIG.get('TONY_LOG_FILE', 'data/tony_log.log')}")
+    log.info(f"  Aggregator interval: {CONFIG.get('AGGREGATOR_POLL_INTERVAL_MINUTES', 1)}min")
+    log.info(f"  Re-analyzer batch: {CONFIG.get('RE_ANALYZER_BATCH_LIMIT', 40)}")
+    log.info(f"  API Keys: Helius={'✓' if HELIUS_API_KEY else '✗'}, BirdEye={'✓' if BIRDEYE_API_KEY else '✗'}, Gemini={'✓' if os.getenv('GEMINI_API_KEY') else '✗'}")
+    log.info(f"  Chat IDs: Public={PUBLIC_CHAT_ID or 'None'}, VIP={VIP_CHAT_ID or 'None'}")
+    log.info(f"  Performance: Adaptive batching={'✓' if CONFIG.get('ADAPTIVE_BATCH_SIZE') else '✗'}")
