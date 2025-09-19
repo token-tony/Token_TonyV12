@@ -11,3 +11,7 @@ __pycache__/
 # OS/editor cruft
 .DS_Store
 *.swp
+
+# Runtime data artifacts
+data/*
+!data/.gitkeep

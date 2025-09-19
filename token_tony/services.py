@@ -1,51 +1,89 @@
 # -*- coding: utf-8 -*-
+"""Core HTTP helpers and third-party API integrations for Token Tony."""
+from __future__ import annotations
+
 import asyncio
 import logging
-import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
 
 import httpx
 from cachetools import TTLCache
 
 from config import CONFIG, HELIUS_API_KEY
-try:
-    from .api_core import (
-        _fetch,
-        _is_ipfs_uri,
-        fetch_birdeye,
-        fetch_creator_dossier_bitquery,
-        fetch_dexscreener_by_mint,
-        fetch_gecko_market_data,
-        fetch_helius_asset,
-        fetch_holders_count_via_rpc,
-        fetch_ipfs_json,
-        fetch_jupiter_has_route,
-        fetch_rugcheck_score,
-        fetch_top10_via_rpc,
-        fetch_twitter_stats,
-    )
-    from .db_core import _execute_db
-except ImportError:  # pragma: no cover - fallback when run as script
-    from api_core import (  # type: ignore
-        _fetch,
-        _is_ipfs_uri,
-        fetch_birdeye,
-        fetch_creator_dossier_bitquery,
-        fetch_dexscreener_by_mint,
-        fetch_gecko_market_data,
-        fetch_helius_asset,
-        fetch_holders_count_via_rpc,
-        fetch_ipfs_json,
-        fetch_jupiter_has_route,
-        fetch_rugcheck_score,
-        fetch_top10_via_rpc,
-        fetch_twitter_stats,
-    )
-    from db_core import _execute_db  # type: ignore
+from http_client import _fetch
+from token_tony.services.birdeye import fetch_birdeye
+from token_tony.services.bitquery import fetch_creator_dossier_bitquery
+from token_tony.services.dexscreener import fetch_dexscreener_by_mint, fetch_dexscreener_chart
+from token_tony.services.gecko import fetch_gecko_market_data
+from token_tony.services.helius import fetch_helius_asset, fetch_top10_via_rpc, fetch_holders_count_via_rpc
+from token_tony.services.ipfs import fetch_ipfs_json, _is_ipfs_uri
+from token_tony.services.jupiter import fetch_jupiter_has_route
+from token_tony.services.rugcheck import fetch_rugcheck_score
+from token_tony.services.solana import fetch_holders_via_program_accounts
+from token_tony.services.twitter import fetch_twitter_stats
 
-log = logging.getLogger("token_tony.analysis")
+try:
+    from .db_core import _execute_db
+except ImportError:
+    from db_core import _execute_db
+
+log = logging.getLogger("token_tony.services")
+
+
+async def fetch_market_snapshot(client: httpx.AsyncClient, mint: str) -> Optional[Dict[str, Any]]:
+    # Primary: DexScreener
+    ds = await fetch_dexscreener_by_mint(client, mint)
+    if ds:
+        return ds
+    # Secondary: BirdEye
+    be = await fetch_birdeye(client, mint)
+    if be and isinstance(be.get("data"), dict):
+        data = be["data"]
+        try:
+            return {
+                "price_usd": float(data.get("price", 0.0)),
+                "price_change_24h": float(data.get("priceChange24h", 0.0)),
+                "volume_24h_usd": float(data.get("v24h", 0.0)),
+                "liquidity_usd": float(data.get("liquidity", 0.0)),
+                "market_cap_usd": float(data.get("mc", 0.0)),
+            }
+        except Exception:
+            pass
+    # Tertiary: GeckoTerminal
+    return await fetch_gecko_market_data(client, mint)
+
+
+async def fetch_market_pair_address(client: httpx.AsyncClient, mint: str) -> Optional[str]:
+    """Utility to fetch the most liquid DexScreener pair address for a mint."""
+    ds = await fetch_dexscreener_by_mint(client, mint)
+    if ds:
+        return ds.get("pair_address")
+    return None
+
+
+__all__ = [
+    "fetch_birdeye",
+    "fetch_creator_dossier_bitquery",
+    "fetch_dexscreener_by_mint",
+    "fetch_dexscreener_chart",
+    "fetch_gecko_market_data",
+    "fetch_helius_asset",
+    "fetch_holders_count_via_rpc",
+    "fetch_holders_via_program_accounts",
+    "fetch_ipfs_json",
+    "fetch_jupiter_has_route",
+    "fetch_market_pair_address",
+    "fetch_market_snapshot",
+    "fetch_rugcheck_score",
+    "fetch_top10_via_rpc",
+    "fetch_twitter_stats",
+    "enrich_token_intel",
+    "_compute_sss",
+    "_compute_mms",
+    "_compute_score",
+    "_score_confidence",
+]
 
 # --- Caches ---
 _intel_cache: TTLCache = TTLCache(maxsize=200, ttl=120)
@@ -373,4 +411,3 @@ async def enrich_token_intel(c: httpx.AsyncClient, mint: str, deep_dive: bool = 
     
     _intel_cache[cache_key] = intel
     return intel
-

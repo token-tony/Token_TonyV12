@@ -7,132 +7,75 @@ import json
 import logging
 import random
 import time
-from threading import Lock
 from typing import Any, Dict, Iterable, Optional
 
 import httpx
 
-from config import CONFIG
-from utils import HTTP_LIMITER
+from config import CONFIG, API_RATE_LIMITS
+from token_tony.services.health import _ensure_provider, _record_failure, _record_success, _infer_provider_from_url
 
 log = logging.getLogger("tony_helpers.http_client")
 
-# --------------------------------------------------------------------------------------
-# Provider health tracking / circuit breaker state
-# --------------------------------------------------------------------------------------
+class TokenBucket:
+    def __init__(self, capacity: int, refill_amount: int, interval_seconds: float) -> None:
+        self.capacity = max(1, capacity)
+        self.tokens = float(capacity)
+        self.refill_amount = float(refill_amount)
+        self.interval = float(interval_seconds)
+        self._last = time.monotonic()
+        self._lock = asyncio.Lock()
 
-_PROVIDER_LOCK = Lock()
-
-
-def _new_provider_stats() -> Dict[str, Any]:
-    return {
-        "success": 0,
-        "failure": 0,
-        "circuit_open": False,
-        "circuit_expires": 0.0,
-        "last_error": "",
-        "last_success": 0.0,
-        "last_failure": 0.0,
-        "avg_latency_ms": 0.0,
-    }
-
-
-_INITIAL_PROVIDERS = (
-    "helius",
-    "birdeye",
-    "dexscreener",
-    "gecko",
-    "bitquery",
-    "jupiter",
-    "rugcheck",
-    "twitter",
-    "ipfs",
-)
-
-API_PROVIDERS: Dict[str, Dict[str, Any]] = {
-    name: _new_provider_stats() for name in _INITIAL_PROVIDERS
-}
-# Backwards compatibility alias used by diagnostics output
-API_HEALTH = API_PROVIDERS
-
-# Lite mode flag is toggled when a provider circuit trips
-LITE_MODE_UNTIL: float = 0.0
+    async def acquire(self, amount: float = 1.0) -> None:
+        amount = float(amount)
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._last)
+                if elapsed >= self.interval:
+                    # Add whole-interval refills for stability under load
+                    intervals = int(elapsed // self.interval)
+                    self.tokens = min(self.capacity, self.tokens + intervals * self.refill_amount)
+                    self._last = now if intervals > 0 else self._last
+                if self.tokens >= amount:
+                    self.tokens -= amount
+                    return
+                # Compute time until next token becomes available
+                needed = amount - self.tokens
+                rate_per_sec = (self.refill_amount / self.interval) if self.interval > 0 else self.refill_amount
+                wait = max(0.01, needed / max(1e-6, rate_per_sec))
+            # jitter to avoid thundering herd
+            await asyncio.sleep(min(2.0, wait + random.uniform(0, 0.05)))
 
 
-def _ensure_provider(name: str) -> Dict[str, Any]:
-    if not name:
-        raise ValueError("Provider name must be non-empty")
-    with _PROVIDER_LOCK:
-        if name not in API_PROVIDERS:
-            API_PROVIDERS[name] = _new_provider_stats()
-        return API_PROVIDERS[name]
+class HttpRateLimiter:
+    """Endpoint/host aware limiters.
+    Define buckets by string keys; call await limit('key') before HTTP calls.
+    """
 
+    def __init__(self) -> None:
+        self._buckets: Dict[str, TokenBucket] = {}
+        self._lock = asyncio.Lock()
+        for provider, limits in API_RATE_LIMITS.items():
+            self._buckets[provider] = TokenBucket(
+                capacity=limits["capacity"],
+                refill_amount=limits["refill"],
+                interval_seconds=limits["interval"],
+            )
 
-def _set_lite_mode(until: float) -> None:
-    global LITE_MODE_UNTIL
-    if until > LITE_MODE_UNTIL:
-        LITE_MODE_UNTIL = until
+    async def ensure_bucket(self, key: str, capacity: int, refill: int, interval: float) -> TokenBucket:
+        async with self._lock:
+            if key not in self._buckets:
+                self._buckets[key] = TokenBucket(capacity, refill, interval)
+            return self._buckets[key]
 
+    async def limit(self, key: str) -> None:
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            # Default conservative bucket if unknown
+            bucket = await self.ensure_bucket("generic", capacity=10, refill=10, interval=1.0)
+        await bucket.acquire(1.0)
 
-def _record_success(provider: str, latency_ms: float) -> None:
-    stats = _ensure_provider(provider)
-    stats["success"] += 1
-    stats["last_success"] = time.time()
-    # Simple running average for latency
-    total = stats["success"] + stats["failure"]
-    prev = float(stats.get("avg_latency_ms") or 0.0)
-    stats["avg_latency_ms"] = prev + ((latency_ms - prev) / max(1, total))
-    # Close circuit on success once cooldown elapsed
-    if stats.get("circuit_open") and time.time() >= stats.get("circuit_expires", 0.0):
-        stats["circuit_open"] = False
-
-
-def _record_failure(provider: str, exc: Exception) -> None:
-    stats = _ensure_provider(provider)
-    stats["failure"] += 1
-    stats["last_failure"] = time.time()
-    stats["last_error"] = str(exc)[:200]
-    total = stats["success"] + stats["failure"]
-    threshold = float(CONFIG.get("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 0.6) or 0.6)
-    min_requests = int(CONFIG.get("CIRCUIT_BREAKER_MIN_REQUESTS", 5) or 5)
-    reset_time = int(CONFIG.get("CIRCUIT_BREAKER_RESET_TIME", 300) or 300)
-    if (
-        total >= min_requests
-        and not stats.get("circuit_open")
-        and stats["failure"] / max(1, total) >= threshold
-    ):
-        stats["circuit_open"] = True
-        stats["circuit_expires"] = time.time() + reset_time
-        _set_lite_mode(stats["circuit_expires"])
-        log.warning(
-            "Circuit opened for provider %s (failure ratio %.2f)",
-            provider,
-            stats["failure"] / max(1, total),
-        )
-
-
-def _infer_provider_from_url(url: str) -> Optional[str]:
-    low = url.lower()
-    if "helius" in low:
-        return "helius"
-    if "birdeye" in low:
-        return "birdeye"
-    if "dexscreener" in low:
-        return "dexscreener"
-    if "geckoterminal" in low:
-        return "gecko"
-    if "bitquery" in low:
-        return "bitquery"
-    if "jup.ag" in low or "jupiter" in low:
-        return "jupiter"
-    if "rugcheck" in low:
-        return "rugcheck"
-    if "twitter" in low or "x.com" in low:
-        return "twitter"
-    if "ipfs" in low:
-        return "ipfs"
-    return None
-
+HTTP_LIMITER = HttpRateLimiter()
 
 _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 _HTTP_CLIENT_DS: Optional[httpx.AsyncClient] = None  # DexScreener prefers HTTP/1.1 in practice
@@ -159,20 +102,19 @@ async def close_http_clients():
         await _HTTP_CLIENT_DS.aclose()
         _HTTP_CLIENT_DS = None
 
-
-async def fetch(
+async def _fetch(
+    client: httpx.AsyncClient,
     url: str,
     *,
     method: str = "GET",
     params: Optional[Dict[str, Any]] = None,
-    json_data: Optional[Any] = None,
+    json: Optional[Any] = None,
     data: Optional[Any] = None,
     headers: Optional[Dict[str, str]] = None,
     timeout: Optional[float] = None,
     provider: Optional[str] = None,
     allow_status: Iterable[int] = (200,),
     retries: Optional[int] = None,
-    ds: bool = False,
 ) -> Optional[Any]:
     """Generic HTTP helper with retries and circuit breaker integration."""
 
@@ -182,13 +124,9 @@ async def fetch(
         log.debug("Skipping %s request to %s (circuit open)", provider_name, url)
         return None
 
-    client = await get_http_client(ds=ds)
     attempts = (int(CONFIG.get("HTTP_RETRIES", 2) or 2) + 1) if retries is None else max(1, retries + 1)
     timeout_val = timeout if timeout is not None else float(CONFIG.get("HTTP_TIMEOUT", 15.0) or 15.0)
     last_error: Optional[Exception] = None
-
-    # Apply rate limiting
-    await HTTP_LIMITER.limit(provider_name)
 
     for attempt in range(attempts):
         start = time.perf_counter()
@@ -197,7 +135,7 @@ async def fetch(
                 method,
                 url,
                 params=params,
-                json=json_data,
+                json=json,
                 data=data,
                 headers=headers,
                 timeout=timeout_val,
